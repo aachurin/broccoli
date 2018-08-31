@@ -1,5 +1,16 @@
 import abc
 import typing
+from . injector import Injector
+
+
+class Configurable(abc.ABC):
+
+    @abc.abstractmethod
+    def configure(self, **kwargs) -> None:
+        raise NotImplementedError
+
+    def get_configuration(self) -> typing.Tuple[str, dict]:
+        return '', {}
 
 
 class Logger(abc.ABC):
@@ -76,12 +87,6 @@ class Broker(abc.ABC):
         raise NotImplementedError
 
 
-class App(abc.ABC):
-
-    broker: Broker
-    router: Router
-
-
 class Worker(abc.ABC):
 
     @abc.abstractmethod
@@ -89,8 +94,24 @@ class Worker(abc.ABC):
         raise NotImplementedError
 
 
-class Plugin(abc.ABC):
+class App(abc.ABC):
+
+    broker: Broker
+    router: Router
+    worker: Worker
+    injector: Injector
 
     @abc.abstractmethod
-    def start(self):
+    def inject(self, funcs, event=None):
         raise NotImplementedError
+
+    @abc.abstractmethod
+    def lookup_task(self, name: str):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def __call__(self, request):
+        raise NotImplementedError
+
+
+Event = typing.NewType('Event', dict)

@@ -1,12 +1,13 @@
 import logging
 import inspect
 from . injector import Component
-from . interfaces import Logger
-from . task import Request, Header, TaskName, TaskId
+from . interfaces import App, Logger
+from . task import Task, Request, Header
 from . logger import ConsoleLogger
 
 
 class HeaderComponent(Component):
+
     def resolve(self,
                 parameter: inspect.Parameter,
                 request: Request) -> Header:
@@ -16,14 +17,10 @@ class HeaderComponent(Component):
         return Header(request.headers[name])
 
 
-class TaskNameComponent(Component):
-    def resolve(self, request: Request) -> TaskName:
-        return request.task
+class TaskComponent(Component):
 
-
-class TaskIdComponent(Component):
-    def resolve(self, request: Request) -> TaskId:
-        return request.id
+    def resolve(self, app: App, request: Request) -> Task:
+        return app.lookup_task(request.task)
 
 
 class ArgComponent(Component):
@@ -41,7 +38,7 @@ class ArgComponent(Component):
         return (parameter.annotation is inspect.Signature.empty
                 or parameter.annotation in self.allowed_argument_types)
 
-    def resolve(self, parameter: inspect.Parameter, request: Request) -> typing.Any:
+    def resolve(self, parameter: inspect.Parameter, request: Request):
         if parameter.default is parameter.empty:
             try:
                 return request.args[parameter.name]
@@ -51,13 +48,15 @@ class ArgComponent(Component):
 
 
 class StandardLoggerComponent(Component):
-    def resolve(self, name: TaskName) -> Logger:
-        return logging.getLogger(name)
+
+    def resolve(self, task: Task) -> Logger:
+        return logging.getLogger(task.name)
 
 
 class ConsoleLoggerComponent(Component):
 
     log_level: int
+    _logger: logging.Logger
 
     def __init__(self, *, log_level: str='INFO') -> None:
         if log_level is not None:
@@ -73,8 +72,7 @@ class ConsoleLoggerComponent(Component):
 
 default_components = [
     HeaderComponent(),
-    TaskNameComponent(),
-    TaskIdComponent(),
+    TaskComponent(),
     ArgComponent(),
     ConsoleLoggerComponent(log_level='INFO')
 ]

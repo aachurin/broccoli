@@ -1,7 +1,7 @@
 import time
 import typing
 from . injector import Injector, ReturnValue
-from . interfaces import Broker, Router, Worker
+from . interfaces import Broker, Router, Worker, Event, App as BaseApp
 from . exceptions import TaskNotFound
 from . task import Task, Request, Response
 from . traceback import extract_log_tb
@@ -11,12 +11,8 @@ from . components import default_components
 __all__ = ('App',)
 
 
-class App():
+class App(BaseApp):
 
-    broker: Broker
-    router: Router
-    worker: Worker
-    injector: Injector
     tasks: typing.Dict[str, Task]
     task_class = Task
 
@@ -25,16 +21,16 @@ class App():
                  router=None,
                  worker=None,
                  components=None,
-                 event_hooks=None) -> None:
+                 hooks=None) -> None:
         if components:
             msg = 'components must be a list of instances of Component.'
             assert all([(not isinstance(component, type) and hasattr(component, 'resolve'))
                         for component in components]), msg
-        if event_hooks:
-            msg = 'event_hooks must be a list.'
-            assert isinstance(event_hooks, (list, tuple)), msg
+        if hooks:
+            msg = 'hooks must be a list.'
+            assert isinstance(hooks, (list, tuple)), msg
 
-        self.event_hooks = event_hooks
+        self.hooks = hooks or []
 
         self.check_epoch_time()
         self.init_injector(components)
@@ -42,8 +38,8 @@ class App():
         self.init_router(router)
         self.init_worker(worker)
 
-        self.on_request = self.get_event_hooks('on_request')
-        self.on_response = self.get_event_hooks('on_response', reverse=True)
+        self.on_request = self.get_hooks('on_request')
+        self.on_response = self.get_hooks('on_response', reverse=True)
 
         self.tasks = {}
 
@@ -56,11 +52,10 @@ class App():
     def init_injector(self, components=None):
         components = (components or []) + default_components
         initial_components = {
-            'app': App,
+            'app': BaseApp,
             'request': Request,
             'response': Response,
-            'broker': Broker,
-            'task': Task,
+            'event': Event,
             'exc': Exception,
         }
         self.injector = Injector(components, initial_components)
@@ -89,36 +84,38 @@ class App():
         assert isinstance(worker, Worker), msg
         self.worker = worker
 
-    def get_event_hooks(self, name, reverse=False):
-        event_hooks = self.event_hooks
-        if not event_hooks:
-            return []
+    def get_hooks(self, name, reverse=False):
+        hooks = self.hooks
         if reverse:
-            event_hooks = reversed(event_hooks)
+            hooks = reversed(hooks)
         return [
-            getattr(hook, name) for hook in event_hooks
+            getattr(hook, name) for hook in hooks
             if hasattr(hook, name)
         ]
 
-    def inject(self, funcs):
+    def inject(self,
+               funcs,
+               request: Request = None,
+               response: Response = None,
+               exc: Exception = None,
+               event: dict = None):
         state = {
             'app': self,
-            'broker': self.broker,
-            'request': None,
-            'response': None,
-            'task': None,
-            'exc': None
+            'request': request,
+            'response': response,
+            'exc': exc,
+            'event': event
         }
         return self.injector.run(funcs, state)
 
     def serve(self):
         return self.inject([self.worker.start])
 
-    def lookup_task(self, task_name: str) -> Task:
+    def lookup_task(self, name: str) -> Task:
         try:
-            return self.tasks[task_name]
+            return self.tasks[name]
         except KeyError:
-            raise TaskNotFound(task_name) from None
+            raise TaskNotFound(name) from None
 
     @staticmethod
     def render_response(request: Request,
@@ -134,19 +131,18 @@ class App():
             return Response(id=request.id, exc=exc, traceback=tb)
         return Response(id=request.id, exc=exc)
 
-    def __call__(self, request: Request):
+    def __call__(self, request: Request) -> Response:
         state = {
             'app': self,
             'broker': self.broker,
             'request': request,
             'response': None,
             'exc': None,
-            'task': None,
+            'event': None
         }
 
         try:
             task = self.lookup_task(request.task)
-            state['task'] = task
             funcs = (
                 self.on_request
                 + [task.handler, self.render_response]
@@ -168,9 +164,12 @@ class App():
                 base = base or self.task_class
 
                 options = {}
-                option_keys = getattr(base, 'options', ())
                 for key in list(headers.keys()):
-                    if key in option_keys:
+                    if key.startswith('_'):
+                        raise TypeError('Invalid @task parameter %r' % key)
+                    if hasattr(base, key):
+                        if callable(getattr(base, key)):
+                            raise TypeError('Invalid @task parameter %r' % key)
                         options[key] = headers.pop(key)
 
                 task = type(func.__name__, (base,), dict({
@@ -179,7 +178,7 @@ class App():
                     'handler': staticmethod(func),
                     'headers': headers,
                     '__doc__': func.__doc__,
-                    '__module__': func.__module__,
+                    '__module__': func.__module__
                 }, **options))()
 
                 try:

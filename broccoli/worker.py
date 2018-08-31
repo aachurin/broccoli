@@ -8,10 +8,9 @@ import traceback
 import multiprocessing as mp
 from multiprocessing.connection import wait
 from typing import List
-from . app import App
 from . exceptions import BrokerError, TaskInterrupt, WorkerInterrupt, WarmShutdown, ColdShutdown
-from . interfaces import Worker, Broker, Logger
-from . task import Response
+from . interfaces import App, Worker, Logger, Configurable
+from . task import Request, Response
 
 
 class WorkerScheduler():
@@ -39,7 +38,8 @@ class WorkerScheduler():
             handler(*args)
 
 
-class PreforkWorker(Worker):
+class PreforkWorker(Configurable,
+                    Worker):
     """
     concurrency     Worker concurrency.
     queues          Comma separated list of worker queues.
@@ -55,11 +55,11 @@ class PreforkWorker(Worker):
     stop_on_worker_failure: bool
 
     def __init__(self, *,
-                 concurrency: int=0,
-                 error_timeout: float=5,
-                 fetch_timeout: float=10,
-                 queues: str='default',
-                 stop_on_worker_failure: bool=True) -> None:
+                 concurrency: int = 0,
+                 error_timeout: float = 5,
+                 fetch_timeout: float = 10,
+                 queues: str = 'default',
+                 stop_on_worker_failure: bool = True) -> None:
         self.configure(
             concurrency,
             error_timeout,
@@ -69,11 +69,11 @@ class PreforkWorker(Worker):
             )
 
     def configure(self,
-                  concurrency: int=None,
-                  error_timeout: float=None,
-                  fetch_timeout: float=None,
-                  queues: str=None,
-                  stop_on_worker_failure: bool=None) -> None:
+                  concurrency: int = None,
+                  error_timeout: float = None,
+                  fetch_timeout: float = None,
+                  queues: str = None,
+                  stop_on_worker_failure: bool = None) -> None:
         if concurrency is not None:
             self.concurrency = concurrency if concurrency > 0 else mp.cpu_count()
 
@@ -98,7 +98,8 @@ class PreforkWorker(Worker):
             self.stop_on_worker_failure = stop_on_worker_failure
 
     def get_configuration(self):
-        return {
+        return 'Worker', {
+            'class': self.__class__.__name__,
             'concurrency': self.concurrency,
             'queues': ', '.join(self.queues),
             'error_timeout': self.error_timeout,
@@ -108,21 +109,21 @@ class PreforkWorker(Worker):
 
     @staticmethod
     def start_worker(target, **kwargs):
-        parent_conn, child_conn = mp.Pipe()
+        parent_conn, child_conn = mp.Pipe(False)
         args = [child_conn]
         p = mp.Process(target=target, args=args, kwargs=kwargs)
         p.start()
         parent_conn.p = p
         return parent_conn
 
-    def start(self, app: App, broker: Broker, logger: Logger):
+    def start(self, app: App, logger: Logger):
         shutdown_started = False
         stop_on_worker_failure = self.stop_on_worker_failure
 
         event_hooks = {}
         event_names = ('worker_start', 'worker_error', 'broker_error', 'task_start', 'task_done')
         for event in event_names:
-            hooks = app.get_event_hooks('on_' + event, reverse=(event == 'task_done'))
+            hooks = app.get_hooks('on_' + event, reverse=(event == 'task_done'))
             if hooks:
                 event_hooks[event] = hooks
 
@@ -139,7 +140,7 @@ class PreforkWorker(Worker):
             raise ColdShutdown(signum)
 
         def start_worker():
-            worker = self.start_worker(task_executor, app=app, broker=broker, logger=logger, queues=self.queues,
+            worker = self.start_worker(task_executor, app=app, logger=logger, queues=self.queues,
                                        error_timeout=self.error_timeout, fetch_timeout=self.fetch_timeout,
                                        emit_events=list(event_hooks.keys()))
             workers.append(worker)
@@ -194,15 +195,15 @@ class PreforkWorker(Worker):
                         ready = wait(workers, wait_timeout)
                         for w in ready:
                             try:
-                                event, kwargs = w.recv()
+                                key, event = w.recv()
                             except EOFError:
                                 restart_worker(w)
                                 continue
-                            hooks = event_hooks.get(event)
+                            hooks = event_hooks.get(key)
                             if hooks:
-                                app.inject(hooks)
-                                # for hook in hooks:
-                                #     hook(source=w, scheduler=scheduler, **kwargs)
+                                event['source'] = w.p
+                                event['scheduler'] = scheduler
+                                app.inject(hooks, event=event)
                     except Exception:
                         logger.critical(traceback.format_exc())
                         raise
@@ -217,12 +218,12 @@ class PreforkWorker(Worker):
 
 def task_executor(conn,
                   app: App,
-                  broker: Broker,
                   logger: Logger,
                   queues: List[str],
                   error_timeout: float,
                   fetch_timeout: float,
                   emit_events: list):
+    broker = app.broker
     task_interrupt = TaskInterrupt
     worker_interrupt = WorkerInterrupt
     broker_error = BrokerError
@@ -258,12 +259,8 @@ def task_executor(conn,
     signal.signal(signal.SIGQUIT, worker_cold_interrupt_handler)
     signal.signal(signal.SIGUSR1, task_interrupt_handler)
 
-    def emit(event, req=None, **kwargs):
+    def emit(event, **kwargs):
         if not terminated:
-            if req is not None:
-                kwargs['id'] = req.id
-                kwargs['task'] = req.task
-                kwargs['options'] = req.options
             conn.send((event, kwargs))
 
     logger.info('worker-%d started', pid)
@@ -284,7 +281,7 @@ def task_executor(conn,
                 # from this point it's unsafe to stop worker
                 can_raise = None
                 try:
-                    request = broker.pop_request(queues, fetch_timeout)
+                    request: Request = broker.pop_request(queues, fetch_timeout)
                 except broker_error as exc:
                     logger.error('worker-%d: broker error: %s', pid, str(exc))
                     if emit_broker_error:
@@ -299,9 +296,13 @@ def task_executor(conn,
                 start_time = time.time()
 
                 if emit_task_start:
-                    emit('task_start', request, start_time=start_time)
+                    emit('task_start',
+                         task_id=request.id,
+                         task_name=request.task,
+                         task_headers=request.headers,
+                         task_start_time=start_time)
 
-                response = None
+                response: Response = None
 
                 try:
                     # from this point we can interrupt the task
@@ -314,7 +315,11 @@ def task_executor(conn,
                         response = Response(id=request.id, exc=exc)
                 finally:
                     if emit_task_done:
-                        emit('task_done', request, running_time=(time.time() - start_time))
+                        emit('task_done',
+                             task_id=request.id,
+                             task_name=request.task,
+                             task_headers=request.headers,
+                             task_running_time=(time.time() - start_time))
 
                 if response.exc is not None:
                     if response.traceback:
@@ -328,7 +333,7 @@ def task_executor(conn,
                 while 1:
                     try:
                         broker.push_result(request.id, response,
-                                           request.options.get('result_expires'))
+                                           request.headers.get('result_expires'))
                         break
                     except broker_error as exc:
                         logger.error('worker-%d: broker error: %s', pid, str(exc))

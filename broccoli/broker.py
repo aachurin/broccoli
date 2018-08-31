@@ -1,11 +1,12 @@
 import typing
 import pickle
-from . interfaces import Broker
+from . interfaces import Broker, Configurable
 from . utils import cached_property
 from . exceptions import BrokerError, BrokerResultLocked
 
 
-class RedisBroker(Broker):
+class RedisBroker(Configurable,
+                  Broker):
     """
     broker_url       Redis server URI.
     result_expires   The result expiration timeout.
@@ -42,12 +43,13 @@ class RedisBroker(Broker):
 
     def get_configuration(self):
         ret = {
+            'class': self.__class__.__name__,
             'broker_url': self.broker_url,
             'result_expires': self.result_expires
         }
         if self.gzip_min_length:
             ret['gzip_min_length'] = self.gzip_min_length
-        return ret
+        return 'Broker', ret
 
     @cached_property
     def server(self):

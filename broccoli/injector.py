@@ -25,8 +25,7 @@ class Injector(BaseInjector):
         }
         self.resolver_cache = {}
 
-    def resolve_function(self, func, output_name=None, seen_state=None, parent_parameter=None, parent_function=None,
-                         set_return=False):
+    def resolve_function(self, func, output_name=None, seen_state=None, parent_parameter=None, set_return=False):
         if seen_state is None:
             seen_state = set(self.initial)
 
@@ -43,7 +42,6 @@ class Injector(BaseInjector):
                 output_name = 'return_value'
 
         for parameter in signature.parameters.values():
-            #if parameter.annotation in (int, float)
             if parameter.annotation is ReturnValue:
                 kwargs[parameter.name] = 'return_value'
                 continue
@@ -54,15 +52,9 @@ class Injector(BaseInjector):
                 kwargs[parameter.name] = initial_kwarg
                 continue
 
-            # The 'Parameter' annotation can be used to get the parameter
-            # itself.
+            # The 'Parameter' annotation can be used to get the parameter itself.
             if parameter.annotation is inspect.Parameter:
                 consts[parameter.name] = parent_parameter
-                continue
-
-            # The 'Function' annotation can be used to get the parent function.
-            if parameter.annotation is Function:
-                consts[parameter.name] = parent_function
                 continue
 
             # Otherwise, find a component to resolve the parameter.
@@ -76,8 +68,7 @@ class Injector(BaseInjector):
                             func=component.resolve,
                             output_name=identity,
                             seen_state=seen_state,
-                            parent_parameter=parameter,
-                            parent_function=func
+                            parent_parameter=parameter
                         )
                     break
             else:
@@ -203,4 +194,3 @@ class Component():
 
 
 ReturnValue = typing.TypeVar('ReturnValue')
-Function = typing.TypeVar('Function')
