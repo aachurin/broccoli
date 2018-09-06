@@ -1,6 +1,7 @@
-import typing
 import pickle
-from . interfaces import Broker, Configurable
+from typing import List, Optional
+from . app import App
+from . types import Broker, Configurable, Request, Response
 from . utils import cached_property
 from . exceptions import BrokerError, BrokerResultLocked
 
@@ -11,8 +12,10 @@ class RedisBroker(Configurable,
     broker_url       Redis server URI.
     result_expires   The result expiration timeout.
     gzip_min_length  Sets the minimum length of a message that will be gzipped.
+
     """
 
+    app: App
     broker_url: str
     result_expires: int
     gzip_min_length: int
@@ -29,12 +32,15 @@ class RedisBroker(Configurable,
                   broker_url: str = None,
                   result_expires: int = None,
                   gzip_min_length: int = None):
+
         if broker_url is not None:
             self.broker_url = broker_url
+
         if result_expires is not None:
             if result_expires <= 0:
                 raise ValueError("result_expires must be greater than zero")
             self.result_expires = result_expires
+
         if gzip_min_length is not None:
             if gzip_min_length < 0:
                 raise ValueError("gzip_min_length must be greater than zero")
@@ -61,99 +67,110 @@ class RedisBroker(Configurable,
         import redis.exceptions
         return redis.exceptions.ConnectionError
 
-    def push_request(self, queue: str, req: typing.Any) -> None:
-        queue_key = 'queue.%s' % queue
+    def send_request(self, queue: str, request: Request, expires: int = None) -> None:
+        queue_key = 'queue#' + queue
+        node_key = 'location#' + request.id
+        data = self.dumps(request)
         try:
-            self.server.rpush(queue_key, self.dumps(req))
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-
-    def pop_request(self, queues: typing.List[str], timeout: float = 0) -> typing.Any:
-        queue_keys = ['queue.%s' % q for q in queues]
-        try:
-            req = self.server.brpop(queue_keys, timeout)
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-        if req is not None:
-            return self.loads(req[1])
-        return None
-
-    def set_state(self, task_id: str, value: str, expires: int = None) -> None:
-        state_key = 'state.%s' % task_id
-        expires = expires or self.result_expires
-        try:
-            self.server.setex(state_key, expires, value)
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-
-    def get_state(self, task_id: str) -> None:
-        state_key = 'state.%s' % task_id
-        try:
-            return self.server.get(state_key)
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-
-    def set_meta(self, task_id: str, value: typing.Any, expires: int = None) -> None:
-        value = self.dumps(value)
-        meta_key = 'meta.%s' % task_id
-        expires = expires or self.result_expires
-        try:
-            self.server.setex(meta_key, expires, value)
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-
-    def get_meta(self, task_id: str) -> typing.Any:
-        meta_key = 'meta.%s' % task_id
-        try:
-            ret = self.server.get(meta_key)
-        except self.errors as e:
-            raise BrokerError(str(e)) from None
-        if ret is not None:
-            return self.loads(ret)
-        return None
-
-    def push_result(self, task_id: str, value: typing.Any, expires: int = None) -> None:
-        value = self.dumps(value)
-        result_key = 'result.%s' % task_id
-        expires = expires or self.result_expires
-        try:
-            p = self.server.pipeline().rpush(result_key, value)
-            if expires:
-                p = p.expires(result_key, expires)
+            p = self.server.pipeline()
+            p.rpush(queue_key, data)
+            if expires is not None:
+                p.setex(node_key, expires, '?')
+            else:
+                p.set(node_key, '?')
             p.execute()
         except self.errors as e:
             raise BrokerError(str(e)) from None
 
-    def pop_result(self, task_id: str, timeout: float = 0) -> typing.Any:
-        result_key = 'result.%s' % task_id
-        lock_key = 'lock.%s' % task_id
-        if not self.server.setnx(lock_key, '1'):
-            raise BrokerResultLocked(task_id)
+    def get_request(self, queues: List[str], timeout: float = 0) -> Optional[Request]:
+        queue_keys = [('queue#' + q) for q in queues]
         try:
-            ret = self.server.brpop(result_key, timeout)
+            data = self.server.brpop(queue_keys, timeout)
+        except self.errors as e:
+            raise BrokerError(str(e)) from None
+        if data is None:
+            return None
+        request = self.loads(data[1])
+        node_key = 'location#' + request.id
+        if self.server.set(node_key, self.app.node_id, xx=True):
+            return request
+
+    def send_result(self, response: Response, expires: int = None) -> None:
+        result_key = 'result#' + response.id
+        data = self.dumps(response)
+        expires = expires or self.result_expires
+        try:
+            p = self.server.pipeline()
+            p.rpush(result_key, data)
+            if expires:
+                p.expire(result_key, expires)
+            p.execute()
+        except self.errors as e:
+            raise BrokerError(str(e)) from None
+
+    def get_result(self, response_id: str, timeout: float = 0) -> Optional[Response]:
+        result_key = 'result#' + response_id
+        lock_key = 'lock#' + response_id
+        if not self.server.setnx(lock_key, '1'):
+            raise BrokerResultLocked(response_id)
+        try:
+            data = self.server.brpop(result_key, timeout)
         except self.errors as e:
             raise BrokerError(str(e)) from None
         finally:
             self.server.delete(lock_key)
-        if ret is not None:
-            return self.loads(ret[1])
+        if data is not None:
+            return self.loads(data[1])
         return None
 
-    def peek_result(self, task_id: str, timeout: float = None) -> typing.Any:
-        result_key = 'result.%s' % task_id
+    def peek_result(self, response_id: str, timeout: float = None) -> Optional[Response]:
+        result_key = 'result#' + response_id
         if timeout is not None:
             try:
-                ret = self.server.brpoplpush(result_key, result_key, timeout)
+                data = self.server.brpoplpush(result_key, result_key, timeout)
             except self.errors as e:
                 raise BrokerError(str(e)) from None
         else:
             try:
-                ret = self.server.lindex(result_key, 0)
+                data = self.server.lindex(result_key, 0)
             except self.errors as e:
                 raise BrokerError(str(e)) from None
-        if ret is not None:
-            return self.loads(ret[1])
+        if data is not None:
+            return self.loads(data[1])
         return None
+
+    #     state_key = 'state.%s' % task_id
+    #     expires = expires or self.result_expires
+    #     try:
+    #         self.se    # def set_state(self, task_id: str, value: str, expires: int = None) -> None:rver.setex(state_key, expires, value)
+    #     except self.errors as e:
+    #         raise BrokerError(str(e)) from None
+    #
+    # def get_state(self, task_id: str) -> None:
+    #     state_key = 'state.%s' % task_id
+    #     try:
+    #         return self.server.get(state_key)
+    #     except self.errors as e:
+    #         raise BrokerError(str(e)) from None
+    #
+    # def set_meta(self, task_id: str, value: typing.Any, expires: int = None) -> None:
+    #     value = self.dumps(value)
+    #     meta_key = 'meta.%s' % task_id
+    #     expires = expires or self.result_expires
+    #     try:
+    #         self.server.setex(meta_key, expires, value)
+    #     except self.errors as e:
+    #         raise BrokerError(str(e)) from None
+    #
+    # def get_meta(self, task_id: str) -> typing.Any:
+    #     meta_key = 'meta.%s' % task_id
+    #     try:
+    #         ret = self.server.get(meta_key)
+    #     except self.errors as e:
+    #         raise BrokerError(str(e)) from None
+    #     if ret is not None:
+    #         return self.loads(ret)
+    #     return None
 
 
 def get_encoder(gzip_min_length: int):

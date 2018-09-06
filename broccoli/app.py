@@ -1,22 +1,33 @@
+import re
 import time
+import uuid
 import typing
-from . injector import Injector, ReturnValue
-from . interfaces import Broker, Router, Worker, Event, App as BaseApp
+from . task import Task
 from . exceptions import TaskNotFound
-from . task import Task, Request, Response
+from . injector import Injector, ReturnValue
 from . traceback import extract_log_tb
-from . components import default_components
+from . types import Configurable, Broker, Router, Worker, Event, Request, Response
 
 
 __all__ = ('App',)
 
 
-class App(BaseApp):
+class App(Configurable):
+    """
+    node_id          Unique node name
+    """
+
+    broker: Broker
+    router: Router
+    worker: Worker
+    injector: Injector
+    node_id: str
 
     tasks: typing.Dict[str, Task]
-    task_class = Task
+    hooks: list
 
-    def __init__(self,
+    def __init__(self, *,
+                 node_id=None,
                  broker=None,
                  router=None,
                  worker=None,
@@ -30,18 +41,19 @@ class App(BaseApp):
             msg = 'hooks must be a list.'
             assert isinstance(hooks, (list, tuple)), msg
 
-        self.hooks = hooks or []
-
         self.check_epoch_time()
+
+        self.hooks = hooks or []
+        self.tasks = {}
+
+        self.configure(node_id or str(uuid.uuid4()))
+
         self.init_injector(components)
         self.init_broker(broker)
         self.init_router(router)
         self.init_worker(worker)
 
-        self.on_request = self.get_hooks('on_request')
-        self.on_response = self.get_hooks('on_response', reverse=True)
-
-        self.tasks = {}
+        self.setup()
 
     @staticmethod
     def check_epoch_time():
@@ -50,15 +62,15 @@ class App(BaseApp):
         assert ((tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec) == (1970, 1, 1, 0, 0, 0)), msg
 
     def init_injector(self, components=None):
-        components = (components or []) + default_components
-        initial_components = {
-            'app': BaseApp,
+        from . components import DEFAULT_COMPONENTS
+        components = (components or []) + DEFAULT_COMPONENTS
+        initial = {
+            'app': App,
             'request': Request,
-            'response': Response,
             'event': Event,
             'exc': Exception,
         }
-        self.injector = Injector(components, initial_components)
+        self.injector = Injector(components, initial)
 
     def init_broker(self, broker: Broker):
         if broker is None:
@@ -84,114 +96,41 @@ class App(BaseApp):
         assert isinstance(worker, Worker), msg
         self.worker = worker
 
+    def configure(self,
+                  node_id: str = None):
+        if node_id is not None:
+            if not re.match(r'(?:[a-zA-Z0-9]+[@.\-]?)+$', node_id):
+                raise ValueError("invalid node id")
+            self.node_id = node_id
+
+    def get_configuration(self):
+        ret = {
+            'node_id': self.node_id
+        }
+        return 'Node', ret
+
+    def setup(self):
+        self.broker.bind(self)
+        self.router.bind(self)
+        self.worker.bind(self)
+
     def get_hooks(self, name, reverse=False):
         hooks = self.hooks
         if reverse:
             hooks = reversed(hooks)
-        return [
-            getattr(hook, name) for hook in hooks
-            if hasattr(hook, name)
-        ]
+        return [getattr(hook, name) for hook in hooks if hasattr(hook, name)]
 
-    def inject(self,
-               funcs,
-               request: Request = None,
-               response: Response = None,
-               exc: Exception = None,
-               event: dict = None):
-        state = {
-            'app': self,
-            'request': request,
-            'response': response,
-            'exc': exc,
-            'event': event
-        }
-        return self.injector.run(funcs, state)
-
-    def serve(self):
-        return self.inject([self.worker.start])
-
-    def lookup_task(self, name: str) -> Task:
+    def get_task(self, name: str) -> Task:
         try:
             return self.tasks[name]
         except KeyError:
             raise TaskNotFound(name) from None
 
-    @staticmethod
-    def render_response(request: Request,
-                        return_value: ReturnValue) -> Response:
-        return Response(id=request.id, value=return_value)
-
-    @staticmethod
-    def exception_handler(task: Task,
-                          request: Request,
-                          exc: Exception) -> Response:
-        if task is not None and not isinstance(exc, task.throws):
-            tb = extract_log_tb(exc)
-            return Response(id=request.id, exc=exc, traceback=tb)
-        return Response(id=request.id, exc=exc)
-
-    def __call__(self, request: Request) -> Response:
-        state = {
-            'app': self,
-            'broker': self.broker,
-            'request': request,
-            'response': None,
-            'exc': None,
-            'event': None
-        }
-
-        try:
-            task = self.lookup_task(request.task)
-            funcs = (
-                self.on_request
-                + [task.handler, self.render_response]
-                + self.on_response
-            )
-            return self.injector.run(funcs, state)
-        except Exception as exc:
-            state['exc'] = exc
-            funcs = (
-                [self.exception_handler]
-                + self.on_response
-            )
-            return self.injector.run(funcs, state)
-
     def task(self, *args, **kwargs):
         def create_task_wrapper(func):
-            def create_task(name=None, base=None, **headers):
-                name = name or '%s.%s' % (func.__module__, func.__name__)
-                base = base or self.task_class
-
-                options = {}
-                for key in list(headers.keys()):
-                    if key.startswith('_'):
-                        raise TypeError('Invalid @task parameter %r' % key)
-                    if hasattr(base, key):
-                        if callable(getattr(base, key)):
-                            raise TypeError('Invalid @task parameter %r' % key)
-                        options[key] = headers.pop(key)
-
-                task = type(func.__name__, (base,), dict({
-                    'app': self,
-                    'name': name,
-                    'handler': staticmethod(func),
-                    'headers': headers,
-                    '__doc__': func.__doc__,
-                    '__module__': func.__module__
-                }, **options))()
-
-                try:
-                    task.__qualname__ = func.__qualname__
-                except AttributeError:
-                    pass
-
-                task.__name__ = func.__name__
-
-                self.tasks[name] = task
-                return task
-
-            return create_task(**kwargs)
+            task = Task.create_task(func, self, **kwargs)
+            self.tasks[task.name] = task
+            return task
 
         if len(args) == 1:
             if callable(args[0]):
@@ -202,3 +141,41 @@ class App(BaseApp):
             raise TypeError("@task() takes exactly 1 argument")
 
         return create_task_wrapper
+
+    def serve(self):
+        return self.inject((self.worker.start,))
+
+    def inject(self,
+               funcs,
+               request: Request = None,
+               event: Event = None,
+               exc: BaseException = None):
+        return self.injector.run(funcs, {
+            'app': self,
+            'request': request,
+            'event': event,
+            'exc': exc,
+        })
+
+    def __call__(self, request: Request) -> Response:
+        try:
+            task = self.get_task(request.task)
+            funcs = (task.handler, self.render_response)
+            return self.inject(funcs, request=request)
+        except Exception as exc:
+            funcs = (self.exception_handler,)
+            return self.inject(funcs, request=request, exc=exc)
+
+    @staticmethod
+    def render_response(request: Request,
+                        return_value: ReturnValue) -> Response:
+        return Response(request.id, value=return_value)
+
+    @staticmethod
+    def exception_handler(task: Task,
+                          request: Request,
+                          exc: Exception) -> Response:
+        if not isinstance(exc, task.throws):
+            tb = extract_log_tb(exc)
+            return Response(request.id, exc=exc, traceback=tb)
+        return Response(request.id, exc=exc)

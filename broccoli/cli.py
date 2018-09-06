@@ -5,7 +5,8 @@ import typing
 import importlib
 import inspect
 from collections import OrderedDict
-from . interfaces import App, Configurable
+from . app import App
+from . types import Configurable
 from . exceptions import ConfigurationError
 from . splash import splash
 
@@ -69,7 +70,7 @@ class Configurator():
 
     def get_configurables(self) -> typing.List[Configurable]:
         check = (
-            [self.app.router, self.app.broker, self.app.worker]
+            [self.app, self.app.router, self.app.broker, self.app.worker]
             + self.app.injector.components
             + self.app.hooks
         )
@@ -80,10 +81,8 @@ class Configurator():
         for obj in self.get_configurables():
             for identity, option in self.get_cli_options(obj):
                 if identity in options:
-                    if options[identity].type != option.type:
-                        msg = 'option "%s" got multiple types'
-                        raise ConfigurationError(msg % identity)
-                    continue
+                    msg = 'option "%s" already used'
+                    raise ConfigurationError(msg % identity)
                 options[identity] = option
         return list(options.values())
 

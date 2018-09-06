@@ -1,47 +1,47 @@
-import os
-import re
-import time
-from calendar import monthrange
-from datetime import datetime
-from collections import Iterable
-from . exceptions import BrokerError
-from . interfaces import Logger
-from . utils import cached_property
-import signal
+# import os
+# import re
+# import time
+# from calendar import monthrange
+# from datetime import datetime
+# from collections import Iterable
+# from . exceptions import BrokerError
+# from . interfaces import Logger
+# from . utils import cached_property
+# import signal
 
-
-def plugin(fun):
-    return type(fun.__name__, (object,), {
-        'start': staticmethod(fun)
-    })
-
-
-@plugin
-def task_killer(logger: Logger):
-    running_tasks: set = set()
-
-    def kill_task(source, id):
-        if id in running_tasks:
-            logger.warning('\U0001F4A3 kill task %s due to time limit', id)
-            os.kill(source.p.pid, signal.SIGUSR1)
-            running_tasks.remove(id)
-
-    def on_task_start(source, sched, id, options, start_time, **kwargs):
-        limit = options.get('time_limit')
-        if limit is not None:
-            running_tasks.add(id)
-            sched.call_at(start_time + limit, kill_task, args=(source, id))
-
-    def on_task_done(id, **kwargs):
-        if id in running_tasks:
-            running_tasks.remove(id)
-
-    logger.info('task killer starts watching \U0001F4A3')
-
-    return {
-        'task_start': on_task_start,
-        'task_done': on_task_done
-    }
+#
+# def plugin(fun):
+#     return type(fun.__name__, (object,), {
+#         'start': staticmethod(fun)
+#     })
+#
+#
+# @plugin
+# def task_killer(logger: Logger):
+#     running_tasks: set = set()
+#
+#     def kill_task(source, id):
+#         if id in running_tasks:
+#             logger.warning('\U0001F4A3 kill task %s due to time limit', id)
+#             os.kill(source.p.pid, signal.SIGUSR1)
+#             running_tasks.remove(id)
+#
+#     def on_task_start(source, sched, id, options, start_time, **kwargs):
+#         limit = options.get('time_limit')
+#         if limit is not None:
+#             running_tasks.add(id)
+#             sched.call_at(start_time + limit, kill_task, args=(source, id))
+#
+#     def on_task_done(id, **kwargs):
+#         if id in running_tasks:
+#             running_tasks.remove(id)
+#
+#     logger.info('task killer starts watching \U0001F4A3')
+#
+#     return {
+#         'task_start': on_task_start,
+#         'task_done': on_task_done
+#     }
 
 
 # class CronBeat(Plugin):

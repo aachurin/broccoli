@@ -1,4 +1,3 @@
-import inspect
 from . utils import get_colorizer, color
 
 

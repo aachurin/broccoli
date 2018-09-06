@@ -1,5 +1,5 @@
 import typing
-from . interfaces import Configurable, Router
+from . types import Configurable, Router
 
 
 class SimpleRouter(Configurable,

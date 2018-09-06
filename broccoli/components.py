@@ -1,9 +1,25 @@
 import logging
 import inspect
+from . app import App
 from . injector import Component
-from . interfaces import App, Logger
-from . task import Task, Request, Header
+from . types import Broker, Router, Logger
+from . types import Request, Header
 from . logger import ConsoleLogger
+from . task import Task
+
+
+class BrokerComponent(Component):
+
+    def resolve(self,
+                app: App) -> Broker:
+        return app.broker
+
+
+class RouterComponent(Component):
+
+    def resolve(self,
+                app: App) -> Router:
+        return app.router
 
 
 class HeaderComponent(Component):
@@ -20,7 +36,7 @@ class HeaderComponent(Component):
 class TaskComponent(Component):
 
     def resolve(self, app: App, request: Request) -> Task:
-        return app.lookup_task(request.task)
+        return app.tasks[request.task]
 
 
 class ArgComponent(Component):
@@ -70,7 +86,9 @@ class ConsoleLoggerComponent(Component):
         return self._logger
 
 
-default_components = [
+DEFAULT_COMPONENTS = [
+    BrokerComponent(),
+    RouterComponent(),
     HeaderComponent(),
     TaskComponent(),
     ArgComponent(),

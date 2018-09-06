@@ -1,6 +1,6 @@
 import time
 import logging
-from . interfaces import Logger
+from . types import Logger
 from . utils import get_colorizer, color
 
 

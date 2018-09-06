@@ -1,97 +1,90 @@
 import typing
 from uuid import uuid4
-from . interfaces import App
-from . traceback import Traceback
+from . types import Request, Response, TaskName
 
 
-class State:
+class Task:
 
-    PENDING = 'pending'
-    RUNNING = 'running'
-    ERROR = 'error'
-    DONE = 'done'
-
-
-Header = typing.NewType('Header', typing.Any)
-
-
-class Request(typing.NamedTuple):
-
-    id: str
-    task: str
-    args: typing.Optional[typing.Dict[str, typing.Any]]
-    headers: typing.Dict[str, Header]
-
-
-class Response(typing.NamedTuple):
-
-    id: str
-    value: typing.Optional[typing.Any] = None
-    exc: typing.Optional[BaseException] = None
-    traceback: typing.Optional[str] = None
-
-
-class Task():
-
-    name: str
+    name: TaskName
     handler: typing.Callable
     headers: dict
 
     # Tuple of expected exceptions.
     throws = ()
 
-    def __call__(self, *args, **kwargs):
-        __log_tb_stop__ = 0
-        return self.apply(args, kwargs)
-
-    def delay(self, **kwargs):
-        return self.apply(kwargs, async=True)
-
-    def apply(self, args=None, queue=None, async=False, headers=None):
+    def apply(self, args=None, queue=None, async=False, expires=None, **headers):
         app = self.app
         args = args or {}
         queue = queue or app.router.get_queue(self.name)
-        headers = dict(self.headers, **(headers or ()))
+        headers = dict(self.headers, **headers)
         task_id = uuid4().hex
         request = Request(task_id, self.name, args, headers)
-        app.broker.push_request(queue, request)
+        app.broker.send_request(queue, request, expires)
 
         if async:
             return AsyncResult(app, task_id)
 
-        result = app.broker.pop_result(task_id)
-        return self.unpack_response(result)
+        response: Response = app.broker.get_result(task_id)
+        return response.get_value()
+
+    def delay(self, **kwargs):
+        return self.apply(kwargs, async=True)
+
+    def __call__(self, **kwargs):
+        return self.apply(kwargs)
 
     @staticmethod
-    def unpack_response(response: Response, raise_exception: bool = True):
-        if response.exc is not None:
-            if raise_exception:
-                tb = Traceback(response.traceback) if response.traceback else None
-                raise response.exc from tb
-            return response.exc
-        return response.value
+    def create_task(func, app, name=None, base=None, **headers):
+        name = name or '%s.%s' % (func.__module__, func.__name__)
+        base = base or Task
+
+        options = {}
+
+        for key in list(headers.keys()):
+            if key.startswith('_'):
+                raise TypeError('Invalid @task parameter %r' % key)
+            if hasattr(base, key):
+                if callable(getattr(base, key)):
+                    raise TypeError('Invalid @task parameter %r' % key)
+                options[key] = headers.pop(key)
+
+        task = type(func.__name__, (base,), dict({
+            'app': app,
+            'name': name,
+            'handler': staticmethod(func),
+            'headers': headers,
+            '__doc__': func.__doc__,
+            '__module__': func.__module__
+        }, **options))()
+
+        try:
+            task.__qualname__ = func.__qualname__
+        except AttributeError:
+            pass
+
+        task.__name__ = func.__name__
+
+        return task
 
     def __repr__(self):
         return repr(self.handler)
 
 
-class AsyncResult():
+class AsyncResult:
 
-    __slots__ = ('app', 'task_id')
-
-    def __init__(self, app: App, task_id: str) -> None:
+    def __init__(self, app, task_id) -> None:
         self.app = app
         self.task_id = task_id
 
     def get(self, default=None, raise_exception=False) -> typing.Any:
-        result = self.app.broker.peek_result(self.task_id)
-        if result is None:
+        response: Response = self.app.broker.peek_result(self.task_id)
+        if response is None:
             return default
-        return Task.unpack_response(result, raise_exception)
+        return response.get_value(raise_exception)
 
-    def wait(self):
-        result = self.app.broker.pop_result(self.task_id)
-        return Task.unpack_response(result)
+    def wait(self, raise_exception=False):
+        response: Response = self.app.broker.get_result(self.task_id)
+        return response.get_value(raise_exception)
 
     def __repr__(self):
         return '%s(task_id=%r)' % (self.__class__.__name__, self.task_id)
