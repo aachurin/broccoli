@@ -6,6 +6,7 @@ from . traceback import Traceback
 TaskId = NewType('TaskId', str)
 TaskName = NewType('TaskName', str)
 Header = NewType('Header', Any)
+Event = NewType('Event', dict)
 
 
 class State:
@@ -31,7 +32,7 @@ class Request:
         self.headers = headers
 
     def __repr__(self):
-        return '%s, args=%s, headers=%s' % (self.task, self.args, self.headers)
+        return '%r, id=%r, args=%s, headers=%s' % (self.task, self.id, self.args, self.headers)
 
 
 class Response:
@@ -146,6 +147,3 @@ class Worker(abc.ABC):
     def start(self, *args, **kwargs):
         raise NotImplementedError
 
-
-class Event():
-    pass

@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import heapq
 import typing
@@ -118,32 +117,35 @@ class PreforkWorker(Configurable,
 
     def start(self, logger: Logger):
         app: App = self.app
-        shutdown_started = False
+        warm_shutdown_started = False
+        cold_shutdown_started = False
         stop_on_worker_failure = self.stop_on_worker_failure
 
         event_hooks = {}
-        event_names = ('worker_start', 'worker_error', 'broker_error', 'task_start', 'task_done')
+        event_names = ('task_start', 'task_done')
         for event in event_names:
             hooks = app.get_hooks('on_' + event, reverse=(event == 'task_done'))
             if hooks:
                 event_hooks[event] = hooks
 
         def warm_shutdown_handler(signum, _):
-            nonlocal shutdown_started
-            if shutdown_started:
+            nonlocal warm_shutdown_started
+            if warm_shutdown_started:
                 if signum == signal.SIGINT:
-                    raise ColdShutdown(signum)
+                    cold_shutdown_handler(signum, None)
             else:
-                shutdown_started = True
+                warm_shutdown_started = True
                 raise WarmShutdown(signum)
 
         def cold_shutdown_handler(signum, _):
-            raise ColdShutdown(signum)
+            nonlocal cold_shutdown_started
+            if not cold_shutdown_started:
+                cold_shutdown_started = True
+                raise ColdShutdown(signum)
 
         def start_worker():
             worker = self.start_worker(task_executor, app=app, logger=logger, queues=self.queues,
-                                       error_timeout=self.error_timeout, fetch_timeout=self.fetch_timeout,
-                                       emit_events=list(event_hooks.keys()))
+                                       error_timeout=self.error_timeout, fetch_timeout=self.fetch_timeout)
             workers.append(worker)
 
         def restart_worker(worker):
@@ -161,7 +163,9 @@ class PreforkWorker(Configurable,
                 scheduler.call_in(0, start_worker)
 
         def stop_workers(soft=False):
-            sig = signal.SIGTERM if soft else signal.SIGQUIT
+            if not soft:
+                logger.warning('cold shutdown started.')
+            sig = signal.SIGTERM if soft else signal.SIGKILL
             for worker in workers:
                 if worker.p.is_alive():
                     os.kill(worker.p.pid, sig)
@@ -204,13 +208,7 @@ class PreforkWorker(Configurable,
                             if hooks:
                                 event['source'] = w.p
                                 event['scheduler'] = scheduler
-                                state = {
-                                    'app': app,
-                                    'request': None,
-                                    'exc': None,
-                                    'event': event
-                                }
-                                app.injector.run(hooks, state)
+                                app.inject(hooks, event.get('request'), event)
                     except Exception:
                         logger.critical(traceback.format_exc())
                         raise
@@ -228,22 +226,14 @@ def task_executor(conn,
                   logger: Logger,
                   queues: typing.List[str],
                   error_timeout: float,
-                  fetch_timeout: float,
-                  emit_events: list):
+                  fetch_timeout: float):
     broker = app.broker
     task_interrupt = TaskInterrupt
     worker_interrupt = WorkerInterrupt
     broker_error = BrokerError
-    exception = Exception
-    emit_worker_start = 'worker_start' in emit_events
-    emit_worker_error = 'worker_error' in emit_events
-    emit_broker_error = 'broker_error' in emit_events
-    emit_task_start = 'task_start' in emit_events
-    emit_task_done = 'task_done' in emit_events
     can_raise = None
     terminated = False
     pid = os.getpid()
-    del emit_events
 
     def task_interrupt_handler(_, __):
         nonlocal can_raise
@@ -258,12 +248,8 @@ def task_executor(conn,
             can_raise = None
             raise worker_interrupt()
 
-    def worker_cold_interrupt_handler(_, __):
-        sys.exit(-1)
-
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, worker_warm_interrupt_handler)
-    signal.signal(signal.SIGQUIT, worker_cold_interrupt_handler)
     signal.signal(signal.SIGUSR1, task_interrupt_handler)
 
     def emit(event, **kwargs):
@@ -271,9 +257,6 @@ def task_executor(conn,
             conn.send((event, kwargs))
 
     logger.info('worker[%d] started', pid)
-
-    if emit_worker_start:
-        emit('worker_start')
 
     sleep_timeout = random.random() * 5
 
@@ -291,8 +274,6 @@ def task_executor(conn,
                     request: Request = broker.get_request(queues, fetch_timeout)
                 except broker_error as exc:
                     logger.error('worker[%d]: broker error: %s', pid, str(exc))
-                    if emit_broker_error:
-                        emit('broker_error')
                     sleep_timeout = error_timeout
                     continue
 
@@ -302,12 +283,9 @@ def task_executor(conn,
                 logger.debug('worker[%d]: received task %r', pid, request)
                 start_time = time.time()
 
-                if emit_task_start:
-                    emit('task_start',
-                         task_id=request.id,
-                         task_name=request.task,
-                         task_headers=request.headers,
-                         task_start_time=start_time)
+                truncated_request = Request(request.id, request.task, None, request.headers)
+
+                emit('task_start', request=truncated_request, start_time=start_time)
 
                 try:
                     # from this point we can interrupt the task
@@ -315,23 +293,19 @@ def task_executor(conn,
                     response = app(request)
                     can_raise = None
                 except task_interrupt as exc:
-                    logger.debug('worker[%d]: task %r was interrupted', pid, request)
                     response = Response(id=request.id, exc=exc)
                 finally:
-                    if emit_task_done:
-                        emit('task_done',
-                             task_id=request.id,
-                             task_name=request.task,
-                             task_headers=request.headers,
-                             task_running_time=(time.time() - start_time))
+                    emit('task_done', request=truncated_request, running_time=(time.time() - start_time))
 
                 if response.exc is not None:
                     if response.traceback:
-                        logger.error('worker[%d]: task %r raised exception: %r\n%s',
+                        logger.error('worker[%d]: task %r raised exception:\n%r\n%s',
                                      pid, request, response.exc, ''.join(response.traceback))
                     else:
-                        logger.error('worker[%d]: task %r raised exception: %r',
+                        logger.error('worker[%d]: task %r raised exception:\n%r',
                                      pid, request, response.exc)
+                else:
+                    logger.debug('worker[%d]: task %r, id=%r done', pid, request.task, request.id)
 
                 attempts = 5
                 while 1:
@@ -340,8 +314,6 @@ def task_executor(conn,
                         break
                     except broker_error as exc:
                         logger.error('worker[%d]: broker error: %s', pid, str(exc))
-                        if emit_broker_error:
-                            emit('broker_error')
                         if attempts > 0:
                             attempts -= 1
                         elif terminated:
@@ -350,12 +322,10 @@ def task_executor(conn,
                             can_raise = worker_interrupt
                         time.sleep(error_timeout)
 
-            except exception as exc:
+            except Exception:
                 # Something went wrong
                 tb = traceback.format_exc()
                 logger.critical('worker[%d]: %s', pid, tb)
-                if emit_worker_error:
-                    emit('worker_error', exc=exc, traceback=tb)
 
     except worker_interrupt:
         pass

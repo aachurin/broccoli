@@ -69,15 +69,15 @@ class RedisBroker(Configurable,
 
     def send_request(self, queue: str, request: Request, expires: int = None) -> None:
         queue_key = 'queue#' + queue
-        node_key = 'location#' + request.id
+        location_key = 'location#' + request.id
         data = self.dumps(request)
         try:
             p = self.server.pipeline()
             p.rpush(queue_key, data)
             if expires is not None:
-                p.setex(node_key, expires, '?')
+                p.setex(location_key, expires, '?')
             else:
-                p.set(node_key, '?')
+                p.set(location_key, '?')
             p.execute()
         except self.errors as e:
             raise BrokerError(str(e)) from None
@@ -91,16 +91,18 @@ class RedisBroker(Configurable,
         if data is None:
             return None
         request = self.loads(data[1])
-        node_key = 'location#' + request.id
-        if self.server.set(node_key, self.app.node_id, xx=True):
+        location_key = 'location#' + request.id
+        if self.server.set(location_key, self.app.node_id, xx=True):
             return request
 
     def send_result(self, response: Response, expires: int = None) -> None:
         result_key = 'result#' + response.id
+        location_key = 'location#' + response.id
         data = self.dumps(response)
         expires = expires or self.result_expires
         try:
             p = self.server.pipeline()
+            p.delete(location_key)
             p.rpush(result_key, data)
             if expires:
                 p.expire(result_key, expires)
