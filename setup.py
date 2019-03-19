@@ -1,5 +1,14 @@
 import os
+import re
 from setuptools import setup
+
+
+def get_version(package):
+    """
+    Return package version as listed in `__version__` in `init.py`.
+    """
+    init_py = open(os.path.join(package, '__init__.py')).read()
+    return re.search("__version__ = ['\"]([^'\"]+)['\"]", init_py).group(1)
 
 
 def get_packages(package):
@@ -29,7 +38,7 @@ def get_package_data(package):
 
 setup(
     name='broccoli-py',
-    version='0.1',
+    version=get_version('broccoli'),
     url='https://github.com/vulnersCom/broccoli',
     license='BSD',
     author='Andrey Churin',
@@ -40,8 +49,8 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=[
-        'redis',
-        'click'
+        'pytz>=2018.9',
+        'redis>=3.2.1',
     ],
     classifiers=[
         'Development Status :: 3 - Alpha',
@@ -51,12 +60,12 @@ setup(
         'Operating System :: OS Independent',
         'Topic :: Internet :: WWW/HTTP :: Dynamic Content',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ],
     entry_points={
         'console_scripts': [
-            'broccoli=broccoli.cli:cli'
+            'bro=broccoli.cli:main'
         ],
     }
 )

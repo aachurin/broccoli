@@ -1,75 +1,93 @@
-import time
 import logging
-from . types import Logger
-from . utils import get_colorizer, color
+import logging.config
+from broccoli.types import Logger, AppVar, Task
+from broccoli.utils import get_colorizer, color
+from broccoli.components import Component
 
 
 class ConsoleLogger(Logger):
 
-    debug_color = color.silver
-    info_color = color.white
-    warning_color = color.olive
-    error_color = color.maroon
+    debug_color = color.cyan
+    info_color = color.light_white
+    warning_color = color.yellow
+    error_color = color.light_red
     critical_color = color.red
 
+    DEBUG = 10
+    INFO = 20
+    WARNING = 30
+    ERROR = 40
+    CRITICAL = 40
+
     LEVELS = {
-        'CRITICAL': 50,
-        'ERROR': 40,
-        'WARNING': 30,
-        'INFO': 20,
-        'DEBUG': 10,
+        'CRITICAL': CRITICAL,
+        'ERROR': ERROR,
+        'WARNING': WARNING,
+        'INFO': INFO,
+        'DEBUG': DEBUG,
         'NOTSET': 0,
     }
 
-    LEVELS_REVERSE = {
-        v: k for k, v in LEVELS.items()
-    }
+    colorize = staticmethod(get_colorizer())
 
-    def __init__(self, level) -> None:
-        self.colorize = get_colorizer()
-        self.format = self.get_format()
+    def __init__(self, level, thread_name, task_name, format) -> None:
         self.level = level
+        self.thread_name = thread_name
+        self.task_name = task_name
+        self.log_format = format
 
-    @staticmethod
-    def get_format():
-        def formatter(level, text):
-            return '[%.3f %s] - %s' % (
-                time.time(), level, text)
-        return formatter
+    def format(self, level, message):
+        return self.log_format.format(
+            level=level,
+            message=message,
+            thread=self.thread_name,
+            task=self.task_name
+        )
 
     def debug(self, msg, *args) -> None:
-        msg = msg % args if args else msg
-        print(self.colorize(self.format('DEBUG', msg),
-                            self.debug_color))
+        if self.level <= self.DEBUG:
+            msg = msg % args if args else msg
+            print(self.colorize(self.format('DEBUG', msg), self.debug_color))
 
     def info(self, msg, *args) -> None:
-        msg = msg % args if args else msg
-        print(self.colorize(self.format('INFO', msg),
-                            self.info_color))
+        if self.level <= self.INFO:
+            msg = msg % args if args else msg
+            print(self.colorize(self.format('INFO', msg), self.info_color))
 
     def warning(self, msg, *args) -> None:
-        msg = msg % args if args else msg
-        print(self.colorize(self.format('WARNING', msg),
-                            self.warning_color))
+        if self.level <= self.WARNING:
+            msg = msg % args if args else msg
+            print(self.colorize(self.format('WARNING', msg), self.warning_color))
 
     def error(self, msg, *args) -> None:
-        msg = msg % args if args else msg
-        print(self.colorize(self.format('ERROR', msg),
-                            self.error_color))
+        if self.level <= self.ERROR:
+            msg = msg % args if args else msg
+            print(self.colorize(self.format('ERROR', msg), self.error_color))
 
     def critical(self, msg, *args) -> None:
-        msg = msg % args if args else msg
-        print(self.colorize(self.format('CRITICAL', msg),
-                            self.critical_color))
+        if self.level <= self.CRITICAL:
+            msg = msg % args if args else msg
+            print(self.colorize(self.format('CRITICAL', msg), self.critical_color))
 
-    def setLevel(self, level: int) -> None:
-        # noinspection PyUnusedLocal
-        def unlogged(msg, *args):
-            pass
-        for lvl in ('debug', 'info', 'warning', 'error'):
-            # noinspection PyProtectedMember
-            if level > logging._nameToLevel[lvl.upper()]:
-                setattr(self, lvl, unlogged)
-            else:
-                self.__dict__.pop(lvl, None)
-        self.level = level
+
+class StandardLoggerComponent(Component):
+
+    def __init__(self, logging_config=None):
+        if logging_config:
+            logging.config.dictConfig(logging_config)
+
+    # noinspection PyMethodOverriding
+    def resolve(self, task: Task) -> Logger:
+        return logging.getLogger(task.name)
+
+
+class ConsoleLoggerComponent(Component):
+
+    def __init__(self, *, log_level: str = 'DEBUG', format='[{thread}] {level}|{task}: {message}') -> None:
+        self.format = format
+        self.log_level = ConsoleLogger.LEVELS[log_level]
+
+    # noinspection PyMethodOverriding
+    def resolve(self, thread_name: AppVar = 'main', task: Task = None) -> Logger:
+        task_name = task.name if task else 'app'
+        return ConsoleLogger(self.log_level, thread_name, task_name, format=self.format)

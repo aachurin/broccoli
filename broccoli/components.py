@@ -1,96 +1,65 @@
-import logging
+import typing
 import inspect
-from . app import App
-from . injector import Component
-from . types import Broker, Router, Logger
-from . types import Request, Header
-from . logger import ConsoleLogger
-from . task import Task
+from broccoli import exceptions
 
 
-class BrokerComponent(Component):
+class Component:
 
-    def resolve(self,
-                app: App) -> Broker:
-        return app.broker
+    singleton = False
 
-
-class RouterComponent(Component):
-
-    def resolve(self,
-                app: App) -> Router:
-        return app.router
-
-
-class HeaderComponent(Component):
-
-    def resolve(self,
-                parameter: inspect.Parameter,
-                request: Request) -> Header:
-        name = parameter.name
-        if name not in request.headers:
-            return None
-        return Header(request.headers[name])
-
-
-class TaskComponent(Component):
-
-    def resolve(self, app: App, request: Request) -> Task:
-        return app.tasks[request.task]
-
-
-class ArgComponent(Component):
-
-    default_allowed_argument_types = (int, float, bool, str, list, dict, object, tuple)
-
-    def __init__(self, allowed_argument_types=None):
-        self.allowed_argument_types = allowed_argument_types or self.default_allowed_argument_types
+    def __init_subclass__(cls, **kwargs):
+        if cls.singleton:
+            if cls.can_handle_parameter is not Component.can_handle_parameter:
+                msg = (
+                    'Component "%s" should not override `can_handle_parameter`, '
+                    'since it is a singleton'
+                )
+                raise exceptions.ConfigurationError(msg % cls.__name__)
 
     def identity(self, parameter: inspect.Parameter):
+        """
+        Each component needs a unique identifier string that we use for lookups
+        from the `state` dictionary when we run the dependency injection.
+        """
         parameter_name = parameter.name.lower()
-        return 'argument:' + parameter_name
+        annotation_name = parameter.annotation.__name__.lower()
+
+        # If `resolve_parameter` includes `Parameter` then we use an identifier
+        # that is additionally parameterized by the parameter name.
+        args = inspect.signature(self.resolve).parameters.values()
+        if inspect.Parameter in [arg.annotation for arg in args]:
+            return annotation_name + ':' + parameter_name
+
+        # Standard case is to use the class name, lowercased.
+        return annotation_name
 
     def can_handle_parameter(self, parameter: inspect.Parameter):
-        return (parameter.annotation is inspect.Signature.empty
-                or parameter.annotation in self.allowed_argument_types)
+        # Return `True` if this component can handle the given parameter.
+        #
+        # The default behavior is for components to handle whatever class
+        # is used as the return annotation by the `resolve` method.
+        #
+        # You can override this for more customized styles, for example if you
+        # wanted name-based parameter resolution, or if you want to provide
+        # a value for a range of different types.
+        #
+        # Eg. Include the `Request` instance for any parameter named `request`.
+        return_annotation = inspect.signature(self.resolve).return_annotation
+        if return_annotation is inspect.Signature.empty:
+            msg = (
+                'Component "%s" must include a return annotation on the '
+                '`resolve()` method, or override `can_handle_parameter`.'
+            ) % self.__class__.__name__
+            raise exceptions.ConfigurationError(msg)
+        return parameter.annotation is return_annotation
 
-    def resolve(self, parameter: inspect.Parameter, request: Request):
-        if parameter.default is parameter.empty:
-            try:
-                return request.args[parameter.name]
-            except KeyError:
-                raise TypeError("missing required argument: %r" % parameter.name)
-        return request.args.get(parameter.name, parameter.default)
-
-
-class StandardLoggerComponent(Component):
-
-    def resolve(self, task: Task) -> Logger:
-        return logging.getLogger(task.name)
-
-
-class ConsoleLoggerComponent(Component):
-
-    log_level: int
-    _logger: logging.Logger
-
-    def __init__(self, *, log_level: str='INFO') -> None:
-        if log_level is not None:
-            self.log_level = ConsoleLogger.LEVELS[log_level]
-
-    def resolve(self) -> Logger:
-        try:
-            return self._logger
-        except AttributeError:
-            self._logger = ConsoleLogger(self.log_level)
-        return self._logger
+    @typing.no_type_check
+    def resolve(self):
+        raise NotImplementedError()
 
 
-DEFAULT_COMPONENTS = [
-    BrokerComponent(),
-    RouterComponent(),
-    HeaderComponent(),
-    TaskComponent(),
-    ArgComponent(),
-    ConsoleLoggerComponent(log_level='INFO')
-]
+ReturnValue = typing.TypeVar('ReturnValue')
+
+
+class Optional:
+    """Marker for optional components"""

@@ -4,6 +4,8 @@ from traceback import StackSummary
 
 class Traceback(Exception):
 
+    __slots__ = ('tb', )
+
     def __init__(self, tb):
         self.tb = tb
 
@@ -17,14 +19,15 @@ def walk_tb(tb):
     walk_stack). Usually used with StackSummary.extract.
     """
     track = False
+    result = []
     while tb is not None:
         if track:
-            if '__log_tb_stop__' in tb.tb_frame.f_locals:
-                break
-            yield (tb.tb_frame, tb.tb_lineno)
-        elif '__log_tb_start__' in tb.tb_frame.f_locals:
+            result.append((tb.tb_frame, tb.tb_lineno))
+        if '__log_tb_start__' in tb.tb_frame.f_locals:
+            result = []
             track = True
         tb = tb.tb_next
+    return result
 
 
 def extract_log_tb(exc=None):

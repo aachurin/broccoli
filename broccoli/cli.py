@@ -1,142 +1,69 @@
-import re
 import sys
-import click
-import typing
+import argparse
 import importlib
-import inspect
-from collections import OrderedDict
-from . app import App
-from . types import Configurable
-from . exceptions import ConfigurationError
-from . splash import splash
+from broccoli.types import App, Config
+from broccoli.utils import default
 
 
-class Command(click.Command):
+def main():
+    if '' not in sys.path:
+        sys.path.insert(0, '')
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('-A', '--app', default=None)
+    subparsers = parser.add_subparsers(title='commands')
 
-    def get_params(self, ctx):
-        self.params = ctx.obj.get_options()
-        return super().get_params(ctx)
+    for cmd in commands:
+        cmdparser = subparsers.add_parser(cmd, add_help=False)
+        cmdparser.set_defaults(_cmd=(cmd, commands[cmd]))
 
+    args, rest = parser.parse_known_args()
+    if not args.app or not hasattr(args, '_cmd'):
+        parser.print_help()
+        sys.exit(0)
 
-class CLI(click.Group):
+    name, command = args._cmd
+    cmdparser = subparsers.add_parser(name)
+    bootstrap = command(cmdparser)
+    args = vars(parser.parse_args())
+    app = args.pop('app')
 
-    def command(self, *args, **kwargs):
-        return super().command(*args, **kwargs, cls=Command)
-
-
-@click.command(cls=CLI)
-@click.option('-A', '--app', default='taskapp.taskapp', help='Application instance')
-@click.pass_context
-def cli(ctx, app):
-    sys.path[0:0] = ['.']
-
-    try:
-        module, attr = app.rsplit('.', 1)
-    except ValueError:
-        click.echo(click.style('✘', fg='red') + ' Invalid application instance "%s"' % app)
-        sys.exit(1)
-
-    try:
-        module = importlib.import_module(module)
-    except ImportError:
-        click.echo(click.style('✘', fg='red') + ' Could not load application "%s"' % app)
-        raise
-
-    try:
-        instance = getattr(module, attr)
-    except AttributeError:
-        click.echo(click.style('✘', fg='red') + ' Could not load application "%s"' % app)
-        sys.exit(1)
-
-    if not isinstance(instance, App):
-        click.echo(click.style('✘', fg='red') + ' Invalid application instance "%s"' % app)
-        sys.exit(1)
-
-    ctx.obj = Configurator(instance)
-
-
-@cli.command()
-@click.pass_obj
-def worker(configurator, **kwargs):
-    configurator.apply_config(kwargs)
-    configurator.show_startup_info()
-    configurator.app.serve()
-
-
-class Configurator():
-
-    def __init__(self, app: App) -> None:
-        self.app = app
-
-    def get_configurables(self) -> typing.List[Configurable]:
-        check = (
-            [self.app, self.app.router, self.app.broker, self.app.worker]
-            + self.app.injector.components
-            + self.app.hooks
-        )
-        return [obj for obj in check if isinstance(obj, Configurable)]
-
-    def get_options(self):
-        options = OrderedDict()
-        for obj in self.get_configurables():
-            for identity, option in self.get_cli_options(obj):
-                if identity in options:
-                    msg = 'option "%s" already used'
-                    raise ConfigurationError(msg % identity)
-                options[identity] = option
-        return list(options.values())
-
-    def apply_config(self, config):
-        for obj in self.get_configurables():
-            parameters = inspect.signature(obj.configure).parameters
-            kwargs = {key: config[key] for key in parameters.keys() if key in config}
-            try:
-                obj.configure(**kwargs)
-            except (ValueError, TypeError) as e:
-                raise click.ClickException(str(e))
-
-    @staticmethod
-    def get_description(obj):
-        doc = getattr(obj, '__doc__')
-
-        if doc is None:
-            return {}
-
-        param_names = inspect.signature(obj.configure).parameters.keys()
-        param_docs = {}
-        for param_name in param_names:
-            match = re.search(r'^\W*' + param_name + r'\W*(.*)$', doc, re.MULTILINE)
-            if match:
-                param_docs[param_name] = match.groups()[0]
+    def apply_config(config: Config):
+        for k, v in args.items():
+            if isinstance(v, default):
+                if k not in config:
+                    config[k] = v.value
             else:
-                param_docs[param_name] = ''
+                config[k] = v
 
-        return param_docs
+    app_module = importlib.import_module(app)
+    for inst in dir(app_module):
+        app = getattr(app_module, inst)
+        if isinstance(app, App):
+            break
+    else:
+        msg = 'Application not found.'
+        raise TypeError(msg)
 
-    def get_cli_options(self, obj):
-        parameter_descriptions = self.get_description(obj)
-        parameters = inspect.signature(obj.configure).parameters
-        options = []
-        for param_name, param in parameters.items():
-            description = parameter_descriptions.get(param_name, '')
-            annotation = param.annotation
-            name = param_name.replace('_', '-')
-            if annotation is inspect.Parameter.empty:
-                annotation = str
-            if issubclass(annotation, (str, int, float, bool)):
-                options.append((name,
-                                click.Option(('--%s' % name,),
-                                             help=description,
-                                             type=annotation,
-                                             required=False)))
-        return options
+    app.inject([apply_config] + bootstrap, cache=False)
 
-    def show_startup_info(self):
-        configs = []
-        seen = set()
-        for obj in self.get_configurables():
-            key, config = obj.get_configuration()
-            if key not in seen:
-                seen.add(key)
-                configs.append((key, config))
-        splash(configs)
+
+def node(parser):
+    from broccoli import worker
+    worker.add_console_arguments(parser)
+    return worker.bootstrap()
+
+
+def beat(parser):
+    from broccoli import beat
+    beat.add_console_arguments(parser)
+    return beat.bootstrap()
+
+
+commands = {
+    'node': node,
+    'beat': beat
+}
+
+
+if __name__ == "__main__":
+    main()

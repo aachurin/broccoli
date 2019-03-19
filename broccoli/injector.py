@@ -1,33 +1,50 @@
-# Based on original code:
-# https://github.com/encode/apistar/blob/master/apistar/server/injector.py
-
-import asyncio
 import inspect
-import typing
-from . exceptions import ConfigurationError
+from broccoli import exceptions
+from broccoli.components import ReturnValue
 
 
-class BaseInjector():
-
-    def run(self, func, state):
-        raise NotImplementedError()
-
-
-class Injector(BaseInjector):
-
+class Injector:
     allow_async = False
 
     def __init__(self, components, initial):
-        self.components = components
+        self.components = [self.ensure_component(comp) for comp in components]
         self.initial = dict(initial)
         self.reverse_initial = {
             val: key for key, val in initial.items()
         }
+        self.singletons = {}
         self.resolver_cache = {}
 
-    def resolve_function(self, func, output_name=None, seen_state=None, parent_parameter=None, set_return=False):
-        if seen_state is None:
-            seen_state = set(self.initial)
+    def get_component_class(self, parameter):
+        if (parameter.annotation in (ReturnValue, inspect.Parameter) or
+                parameter.annotation in self.reverse_initial):
+            return parameter.annotation
+        for component in self.components:
+            if component.can_handle_parameter(parameter):
+                return component.__class__
+
+    def clear_cache(self):
+        self.resolver_cache.clear()
+
+    @staticmethod
+    def ensure_component(comp):
+        msg = 'Component "%s" must implement `identity` method.'
+        assert hasattr(comp, 'identity') and callable(comp.identity),\
+            msg % comp.__class__.__name__
+        msg = 'Component "%s" must implement `can_handle_parameter` method.'
+        assert hasattr(comp, 'can_handle_parameter') and callable(comp.can_handle_parameter),\
+            msg % comp.__class__.__name__
+        msg = 'Component "%s" must implement `resolve` method.'
+        assert hasattr(comp, 'resolve') and callable(comp.resolve),\
+            msg % comp.__class__.__name__
+        return comp
+
+    def resolve_function(self,
+                         func,
+                         seen_state,
+                         output_name=None,
+                         parent_parameter=None,
+                         set_return=False):
 
         steps = []
         kwargs = {}
@@ -37,6 +54,7 @@ class Injector(BaseInjector):
 
         if output_name is None:
             if signature.return_annotation in self.reverse_initial:
+                # some functions can override initial state
                 output_name = self.reverse_initial[signature.return_annotation]
             else:
                 output_name = 'return_value'
@@ -52,7 +70,9 @@ class Injector(BaseInjector):
                 kwargs[parameter.name] = initial_kwarg
                 continue
 
-            # The 'Parameter' annotation can be used to get the parameter itself.
+            # The 'Parameter' annotation can be used to get the parameter
+            # itself. Used for example in 'Header' components that need the
+            # parameter name in order to lookup a particular value.
             if parameter.annotation is inspect.Parameter:
                 consts[parameter.name] = parent_parameter
                 continue
@@ -60,137 +80,113 @@ class Injector(BaseInjector):
             # Otherwise, find a component to resolve the parameter.
             for component in self.components:
                 if component.can_handle_parameter(parameter):
-                    identity = component.identity(parameter)
-                    kwargs[parameter.name] = identity
-                    if identity not in seen_state:
-                        seen_state.add(identity)
-                        steps += self.resolve_function(
-                            func=component.resolve,
-                            output_name=identity,
-                            seen_state=seen_state,
-                            parent_parameter=parameter
-                        )
+                    if component in self.singletons:
+                        consts[parameter.name] = self.singletons[component]
+                    else:
+                        identity = component.identity(parameter)
+                        kwargs[parameter.name] = identity
+                        if identity not in seen_state:
+                            seen_state.add(identity)
+                            resolved_steps = self.resolve_function(
+                                component.resolve,
+                                seen_state,
+                                output_name=identity,
+                                parent_parameter=parameter
+                            )
+                            steps += resolved_steps
+                            if getattr(component, 'singleton', False):
+                                steps.append(self.resolve_singleton(component, identity))
                     break
-            else:
-                msg = 'No component able to handle parameter "%s" on function "%s".'
-                raise ConfigurationError(msg % (parameter.name, func.__name__))
+            # it's arg or kwarg
 
-        is_async = asyncio.iscoroutinefunction(func)
+        is_async = inspect.iscoroutinefunction(func)
         if is_async and not self.allow_async:
             msg = 'Function "%s" may not be async.'
-            raise ConfigurationError(msg % (func.__name__, ))
+            raise exceptions.ConfigurationError(msg % (func.__qualname__, ))
 
         step = (func, is_async, kwargs, consts, output_name, set_return)
         steps.append(step)
+
         return steps
 
-    def resolve_functions(self, funcs):
+    def resolve_singleton(self, component, identity):
+        kwargs = {'value': identity}
+
+        def func(value):
+            self.singletons[component] = value
+
+        return func, False, kwargs, (), '_$nocache', False
+
+    def resolve_functions(self, funcs, state):
         steps = []
-        seen_state = set(self.initial)
+        seen_state = set(self.initial) | set(state)
         for func in funcs:
-            func_steps = self.resolve_function(func, seen_state=seen_state, set_return=True)
+            func_steps = self.resolve_function(func, seen_state, set_return=True)
             steps.extend(func_steps)
         return steps
 
-    def run(self, funcs, state, cache=True):
+    def run(self, funcs, state, func_args=None, func_kwargs=None, cache=True):
+        if not funcs:
+            return
         funcs = tuple(funcs)
         try:
             steps = self.resolver_cache[funcs]
         except KeyError:
-            if not funcs:
-                return
-            steps = self.resolve_functions(funcs)
+            steps = self.resolve_functions(funcs, state)
             if cache:
                 self.resolver_cache[funcs] = steps
 
-        output_name: str
+        pass_args_and_kwargs = bool(func_args or func_kwargs)
         for func, is_async, kwargs, consts, output_name, set_return in steps:
-            func_kwargs = {key: state[val] for key, val in kwargs.items()}
-            func_kwargs.update(consts)
-            state[output_name] = func(**func_kwargs)
+            kwargs = {key: state[val] for key, val in kwargs.items()}
+            kwargs.update(consts)
+            if set_return and pass_args_and_kwargs:
+                pass_args_and_kwargs = False
+                state[output_name] = func(*(func_args or ()), **(func_kwargs or {}), **kwargs)
+            else:
+                state[output_name] = func(**kwargs)
             if set_return:
                 state['return_value'] = state[output_name]
 
-        return state[output_name]
+        if cache and '_$nocache' in state:
+            self.resolver_cache.pop(funcs)
 
-    def clear_cache(self, funcs):
-        funcs = tuple(funcs)
-        try:
-            del self.resolver_cache[funcs]
-        except KeyError:
-            pass
+        # noinspection PyUnboundLocalVariable
+        return state[output_name]
 
 
 class ASyncInjector(Injector):
-
     allow_async = True
 
-    async def run_async(self, funcs, state, cache=True):
+    async def run_async(self, funcs, state, func_args=None, func_kwargs=None, cache=True):
+        if not funcs:
+            return
         funcs = tuple(funcs)
         try:
             steps = self.resolver_cache[funcs]
         except KeyError:
-            if not funcs:
-                return
-            steps = self.resolve_functions(funcs)
+            steps = self.resolve_functions(funcs, state)
             if cache:
                 self.resolver_cache[funcs] = steps
 
-        output_name: str
+        pass_args_and_kwargs = bool(func_args or func_kwargs)
         for func, is_async, kwargs, consts, output_name, set_return in steps:
-            func_kwargs = {key: state[val] for key, val in kwargs.items()}
-            func_kwargs.update(consts)
-            if is_async:
-                state[output_name] = await func(**func_kwargs)
+            kwargs = {key: state[val] for key, val in kwargs.items()}
+            kwargs.update(consts)
+            if set_return and pass_args_and_kwargs:
+                pass_args_and_kwargs = False
+                output = func(*(func_args or ()), **(func_kwargs or {}), **kwargs)
             else:
-                state[output_name] = func(**func_kwargs)
+                output = func(**kwargs)
+            if is_async:
+                state[output_name] = await output
+            else:
+                state[output_name] = output
             if set_return:
                 state['return_value'] = state[output_name]
 
+        if cache and '_$nocache' in state:
+            self.resolver_cache.pop(funcs)
+
+        # noinspection PyUnboundLocalVariable
         return state[output_name]
-
-
-class Component():
-
-    def identity(self, parameter: inspect.Parameter):
-        """
-        Each component needs a unique identifier string that we use for lookups
-        from the `state` dictionary when we run the dependency injection.
-        """
-        parameter_name = parameter.name.lower()
-        annotation_name = parameter.annotation.__name__.lower()
-
-        # If `resolve_parameter` includes `Parameter` then we use an identifier
-        # that is additionally parameterized by the parameter name.
-        args = inspect.signature(self.resolve).parameters.values()
-        if inspect.Parameter in [arg.annotation for arg in args]:
-            return annotation_name + ':' + parameter_name
-
-        # Standard case is to use the class name, lowercased.
-        return annotation_name
-
-    def can_handle_parameter(self, parameter: inspect.Parameter):
-        # Return `True` if this component can handle the given parameter.
-        #
-        # The default behavior is for components to handle whatever class
-        # is used as the return annotation by the `resolve` method.
-        #
-        # You can override this for more customized styles, for example if you
-        # wanted name-based parameter resolution, or if you want to provide
-        # a value for a range of different types.
-        #
-        # Eg. Include the `Request` instance for any parameter named `request`.
-        return_annotation = inspect.signature(self.resolve).return_annotation
-        if return_annotation is inspect.Signature.empty:
-            msg = (
-                'Component "%s" must include a return annotation on the '
-                '`resolve()` method, or override `can_handle_parameter`'
-            )
-            raise ConfigurationError(msg % self.__class__.__name__)
-        return parameter.annotation is return_annotation
-
-    def resolve(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-ReturnValue = typing.TypeVar('ReturnValue')
