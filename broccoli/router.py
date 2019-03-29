@@ -3,9 +3,6 @@ from broccoli.types import Router
 from broccoli.components import Component
 
 
-__all__ = ('SimpleRouterComponent', )
-
-
 class SimpleRouter(Router):
 
     def __init__(self, task_routes, default_queue):
@@ -17,10 +14,9 @@ class SimpleRouter(Router):
 
 
 class SimpleRouterComponent(Component):
-
     singleton = True
 
-    __slots__ = ('config', )
+    __slots__ = ('config',)
 
     def __init__(self,
                  task_routes: typing.Dict[str, str] = None,
@@ -32,3 +28,8 @@ class SimpleRouterComponent(Component):
 
     def resolve(self) -> Router:
         return SimpleRouter(**self.config)
+
+
+ROUTER_COMPONENTS = [
+    SimpleRouterComponent()
+]

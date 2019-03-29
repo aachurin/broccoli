@@ -21,6 +21,7 @@ class cached_property:
     Optional ``name`` argument allows you to make cached properties of other
     methods. (e.g.  url = cached_property(get_absolute_url, name='url') )
     """
+
     def __init__(self, func, name=None):
         self.func = func
         self.__doc__ = getattr(func, '__doc__')
@@ -103,8 +104,8 @@ def _fake_colorizer(text, _):
 _fake_colorizer.support_colors = False  # type: ignore
 
 
-def _simple_colorizer(text, color):
-    return '\x1b[%sm%s\x1b[0m' % (color, text)
+def _simple_colorizer(text, fg):
+    return '\x1b[%sm%s\x1b[0m' % (fg, text)
 
 
 _simple_colorizer.support_colors = True  # type: ignore

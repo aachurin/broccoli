@@ -1,45 +1,18 @@
 import os
 import sys
-import time
 import uuid
+import time as _time
+import random as _random
 import heapq
 import signal
-import random
 import traceback
 import multiprocessing as mp
-from multiprocessing.connection import wait
+from multiprocessing import connection
 from broccoli import __version__
 from broccoli.utils import get_colorizer, color, default, validate
-from broccoli.types import App, Broker, Logger, Config, Context
-
-
-class WorkerInterrupt(BaseException):
-    """Worker interrupt"""
-
-
-class Shutdown(BaseException):
-    pass
-
-
-class Scheduler(list):
-
-    heappush = heapq.heappush
-    heappop = heapq.heappop
-
-    def call_in(self, timeout, handler, args=()):
-        self.heappush(self, (timeout + time.time(), handler, args))
-
-    def call_at(self, at, handler, args=()):
-        self.heappush(self, (at, handler, args))
-
-    def run_once(self):
-        curtime = time.time()
-        while self:
-            event_time, handler, args = self[0]
-            if event_time > curtime:
-                return event_time - curtime
-            self.heappop(self)
-            handler(*args)
+from broccoli.components import ReturnValue
+from broccoli.types import App, Broker, LoggerService, Config, Message, MsgRepr as _MsgRepr
+from broccoli.exceptions import WorkerInterrupt, Shutdown, Reject as _Reject
 
 
 def add_console_arguments(parser):
@@ -59,6 +32,11 @@ def add_console_arguments(parser):
                               'By default "default" queue are enabled.'),
                         type=lambda x: x.split(','),
                         default=default(['default']))
+    parser.add_argument('-l', '--loglevel',
+                        dest='loglevel',
+                        help=('Logging level for default logger.'),
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        default=default(['INFO']))
     parser.add_argument('--result-expires-in',
                         dest='result_expires_in',
                         help=('Time (in seconds) to hold task results. Default is 3600.'),
@@ -83,7 +61,6 @@ def bootstrap():
     return [
         validate_config,
         initialize,
-        add_watch_dog,
         start
     ]
 
@@ -133,71 +110,35 @@ def validate_config(config: Config):
     print()
 
 
-def initialize(app: App, config: Config, context: Context):
-    app.update_context_and_reset(
-        node_id=config['worker_node_id'],
-        thread_name='master'
+def initialize(app: App, config: Config):
+    app.set_context(
+        node_id=config['worker_node_id']
     )
-    context.scheduler = Scheduler()
 
 
-def add_watch_dog(broker: Broker, config: Config, context: Context, logger: Logger):
-    node_id = config['worker_node_id']
-    scheduler = context.scheduler
-    watch_dog_enabled = False
+def start(app: App, broker: Broker, config: Config, logger_service: LoggerService):
+    logger = logger_service.get_logger('bro.master')
 
-    def hold_elections():
-        nodes = broker.get_nodes()
-        if any(n[1].endswith('@') for n in nodes):
-            return False
-        nodes.sort(reverse=True)
-        if nodes[0][1] == node_id:
-            broker.set_node_id(node_id + '@')
-            logger.info('Worker fall down watchdog activated.')
-            return True
-        return False
-
-    fall_down_watchdog_interval = config['worker_fall_down_watchdog_interval']
-
-    def watch_dog():
-        nonlocal watch_dog_enabled
-        if not watch_dog_enabled:
-            watch_dog_enabled = hold_elections()
-        if watch_dog_enabled:
-            result = broker.run_gc(verbose=True)
-            if result:
-                for msg, *args in result:
-                    logger.debug(msg, *args)
-        scheduler.call_in(fall_down_watchdog_interval, watch_dog)
-
-    scheduler.call_in(0, watch_dog)
-
-
-def start(app: App, broker: Broker, config: Config, context: Context, logger: Logger):
-
-    def start_worker(thread_name):
+    def start_worker():
         c1, c2 = mp.Pipe(True)
-        p = mp.Process(target=run_worker, args=[app, thread_name, c2])
+        p = mp.Process(target=run_worker, args=[app, c2])
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         p.start()
         signal.signal(signal.SIGINT, shutdown_handler)
         signal.signal(signal.SIGTERM, shutdown_handler)
         c1.p = p
-        c1.thread_name = thread_name
         connections.append(c1)
 
-    def restart_worker(conn):
-        if conn.p.is_alive():
-            conn.p.terminate()
-        conn.close()
-        connections.remove(conn)
-        restart_timeout = 3 + int(random.random() * 5)
-        logger.critical('%s died unexpectedly \U0001f480, restart in %d seconds...',
-                        conn.thread_name, restart_timeout)
-        scheduler.call_in(restart_timeout, start_worker, (conn.thread_name,))
-
-    shutdown_started = False
+    def restart_worker(worker_conn):
+        if worker_conn.p.is_alive():
+            worker_conn.p.terminate()
+        worker_conn.close()
+        connections.remove(worker_conn)
+        restart_timeout = 3 + int(random() * 5)
+        logger.critical('%s died unexpectedly \U0001f480, start new worker in %d seconds...',
+                        worker_conn.p.name, restart_timeout)
+        call_in(restart_timeout, start_worker)
 
     def shutdown_handler(_, __):
         nonlocal shutdown_started
@@ -211,42 +152,88 @@ def start(app: App, broker: Broker, config: Config, context: Context, logger: Lo
     def on_task_done(_conn, _data):
         pass
 
+    def hold_elections():
+        nodes = broker.get_nodes()
+        if any(n[1].endswith('@') for n in nodes):
+            return False
+        nodes.sort(reverse=True)
+        if nodes[0][1] == node_id:
+            broker.set_node_id(node_id + '@')
+            logger.info('Worker fall down watchdog activated.')
+            return True
+        return False
+
+    def watch_dog():
+        nonlocal watch_dog_enabled
+        if not watch_dog_enabled:
+            watch_dog_enabled = hold_elections()
+        if watch_dog_enabled:
+            broker.run_gc()
+        call_in(fall_down_watchdog_interval, watch_dog)
+
+    def call_in(in_seconds, handler, args=()):
+        heappush(tasks, (time() + in_seconds, (handler, args)))
+
+    random = _random.random
+    sleep = _time.sleep
+    time = _time.time
+    wait = connection.wait
+    heappush = heapq.heappush
+    heappop = heapq.heappop
+
+    tasks = []
+    connections = []
+    shutdown_started = False
+    watch_dog_enabled = False
+    node_id = config['worker_node_id']
+    fall_down_watchdog_interval = config['worker_fall_down_watchdog_interval']
+
     event_handlers = {
         'task_start': on_task_start,
         'task_done': on_task_done
     }
 
-    node_id = config['worker_node_id']
-    scheduler = context.scheduler
-    connections = []
+    call_in(0, watch_dog)
 
     try:
         signal.signal(signal.SIGINT, shutdown_handler)
         signal.signal(signal.SIGTERM, shutdown_handler)
 
-        time.sleep(random.random() * 3)
+        sleep(random() * 3)
         broker.set_node_id(node_id)
-        time.sleep(0.5)
+        sleep(0.5)
 
         for ident in range(config['worker_concurrency']):
-            start_worker('worker%d' % (ident + 1))
+            start_worker()
 
         while 1:
-            # noinspection PyBroadException
             try:
-                wait_timeout = scheduler.run_once()
-                ready: list = wait(connections, wait_timeout)
+                while tasks:
+                    next_event_at = tasks[0][0]
+                    timeout = next_event_at - time()
+                    if timeout <= 0:
+                        event_handler, event_args = heappop(tasks)[1]
+                        event_handler(*event_args)
+                    else:
+                        break
+
+                if not tasks:
+                    timeout = None
+
+                ready: list = wait(connections, timeout)
                 for conn in ready:
                     try:
                         event, data = conn.recv()
                     except EOFError:
-                        logger.debug('Broken pipe to %s', conn.thread_name)
+                        logger.debug('Broken pipe to %s', conn.p.name)
                         restart_worker(conn)
                         continue
                     event_handlers[event](conn, data)
+
             except Exception:
                 logger.critical(traceback.format_exc())
                 break
+
     except Shutdown:
         pass
 
@@ -261,21 +248,19 @@ def start(app: App, broker: Broker, config: Config, context: Context, logger: Lo
                 alive.append(conn)
         connections = alive
         if connections:
-            time.sleep(0.5)
+            sleep(0.5)
 
 
-def run_worker(app, thread_name, conn):
+def run_worker(app, conn):
     worker_id = str(uuid.uuid4())
-    app.update_context_and_reset(
-        worker_id=worker_id,
-        thread_name=thread_name
+    app.set_context(
+        worker_id=worker_id
     )
-    app.inject([worker], kwargs={'conn': conn, 'worker_id': worker_id}, cache=False)
+    app.inject([worker], args={'conn': conn, 'worker_id': worker_id}, cache=False)
 
 
-def worker(conn, worker_id, app: App, broker: Broker, logger: Logger, config: Config):
-    fence_counter = 0
-    shutdown_started = False
+def worker(conn, worker_id, app: App, broker: Broker, logger_service: LoggerService, config: Config):
+    logger = logger_service.get_logger('bro.worker')
 
     class fence:
         __slots__ = ()
@@ -290,8 +275,6 @@ def worker(conn, worker_id, app: App, broker: Broker, logger: Logger, config: Co
             if fence_counter == 0 and shutdown_started:
                 raise WorkerInterrupt()
 
-    fence = fence()
-
     def worker_interrupt_handler(_, __):
         nonlocal shutdown_started
         if not shutdown_started:
@@ -303,118 +286,138 @@ def worker(conn, worker_id, app: App, broker: Broker, logger: Logger, config: Co
         frame = sys._getframe(1)
         logger.info('%s: line %s', frame.f_code.co_filename, frame.f_lineno)
 
-    # def task_interrupt_handler(_, __):
-    #     pass
-
-    fetch_timeout = config['broker_fetch_timeout']
-    result_expires_in = config['result_expires_in']
-
     def emit(event, data=None):
         conn.send((event, data))
 
+    def on_request(msg: Message):
+        logger.info('Received task %s.', MsgRepr(msg))
+        start_time = time()
+        msg['_start'] = start_time
+        emit('task_start', {
+            'id': msg['id'],
+            'task': msg['task'],
+            'start_time': start_time
+        })
+
+    def on_response(msg: Message, ret: ReturnValue):
+        running_time = time() - msg['_start']
+        logger.info('Task %s done in %s.', MsgRepr(msg), running_time)
+        emit('task_done', {
+            'id': msg['id'],
+            'task': msg['task'],
+            'start_time': msg['_start'],
+            'running_time': running_time
+        })
+        return ret
+
     def send_reply(reply):
-        reply_to = reply.get('reply_to')
-        result_key = reply.get('result_key')
-        if reply_to or result_key:
-            while 1:
-                try:
-                    if result_key:
-                        broker.set_result(result_key, reply, expires_in=result_expires_in)
-                    else:
-                        broker.send_reply(reply_to, reply)
-                    break
-                except broker.BrokerError as exc:
-                    logger.critical('Broker error: %s', str(exc))
-                    time.sleep(3 + random.random() * 2)
+        key = reply.pop('_context', None)
+        while 1:
+            try:
+                if 'result_key' in reply:
+                    broker.set_result(reply['result_key'], reply, expires_in=result_expires_in)
+                    broker.ack(key)
+                    logger.debug('Set result: %r', MsgRepr(reply))
+                    return
+                elif 'reply_to' in reply:
+                    logger.debug('Send reply: %r', MsgRepr(reply))
+                    broker.send_reply(reply['reply_to'], reply)
+                    broker.ack(key)
+                    return
+                else:
+                    logger.debug('Send message: %r', MsgRepr(reply))
+                    broker.send_message(reply, reply_back=True)
+                    return
+            except broker.BrokerError as err:
+                logger.critical('Broker error: %s', str(err))
+                sleep(3 + random() * 3)
 
-    def on_complete(reply, start_time, ackkey):
-        running_time = time.time() - start_time
-        try:
-            if 'exc' in reply:
-                logger.error('Task %s raised exception - %s: %s\n%s',
-                             message,
-                             reply['exc'].__class__.__name__,
-                             str(reply['exc']),
-                             reply.get('traceback', ''))
+    def main_loop():
+        num_errors = 0
+        while 1:
+            try:
+                messages = None
+                if deferred_messages:
+                    next_message_at = deferred_messages[0][0]
+                    timeout = next_message_at - time()
+                    if timeout <= 0:
+                        messages = [heappop(deferred_messages)[1]]
+                    timeout = getmin(timeout, fetch_timeout)
+                else:
+                    timeout = fetch_timeout
 
-            logger.info('Task %s done in %s.', reply, running_time)
-            logger.debug('Reply: %r.', reply)
+                if not messages:
+                    try:
+                        messages = broker.get_messages(timeout=timeout)
+                        num_errors = 0
+                    except broker.BrokerError as exc:
+                        logger.critical('Broker error: %s', str(exc))
+                        num_errors += 1
+                        sleep_timeout = getmin(num_errors, 10) + random() * 3
+                        if deferred_messages:
+                            sleep_timeout = getmin(sleep_timeout, next_message_at - time())
+                        if sleep_timeout > 0:
+                            sleep(sleep_timeout)
+                        continue
 
-            emit('task_done', {
-                'id': reply['id'],
-                'task': reply['task'],
-                'start_time': start_time,
-                'running_time': running_time
-            })
+                for message_key, message in messages:
+                    message_repr = MsgRepr(message)
+                    run_after = message.get('run_after')
+                    if run_after is not None and isinstance(run_after, (int, float)):
+                        timeout = run_after - time()
+                        if timeout >= 0:
+                            heappush(deferred_messages, (run_after, (message_key, message)))
+                        logger.info('Deferred message %s received. Should be started in %.2f seconds.',
+                                    message_repr, timeout)
+                        continue
 
-            send_reply(reply)
-            broker.ack_message(ackkey)
+                    logger.debug('Got message: %r.', message_repr)
+                    is_reply = 'reply_id' in message
+                    if not is_reply:
+                        message['_context'] = message_key
+                    try:
+                        for message_reply in app.serve_message(message, fence=fence):
+                            send_reply(message_reply)
+                    except Reject as exc:
+                        logger.info('Message %s was rejected: %s', message_repr, str(exc))
+                        continue
+                    finally:
+                        if is_reply:
+                            broker.ack(message_key)
 
-        except Exception:
-            tb = traceback.format_exc()
-            logger.critical('Critical error:\n%s', tb)
+            except Exception:
+                # Something went wrong
+                logger.critical('Critical error:\n%s', traceback.format_exc())
+
+    heappush = heapq.heappush
+    heappop = heapq.heappop
+    getmin = min
+    time = _time.time
+    sleep = _time.sleep
+    random = _random.random
+    Reject = _Reject
+    MsgRepr = _MsgRepr
+
+    fence = fence()
+    fence_counter = 0
+    deferred_messages = []
+    shutdown_started = False
+    fetch_timeout = config['broker_fetch_timeout']
+    result_expires_in = config['result_expires_in']
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, worker_interrupt_handler)
+    signal.signal(signal.SIGUSR2, worker_state_handler)
+
+    app.set_hooks(on_request=on_request,
+                  on_response=on_response)
 
     logger.info('Started, pid=%d, id=%s', os.getpid(), worker_id)
 
     try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, worker_interrupt_handler)
-        # signal.signal(signal.SIGUSR1, task_interrupt_handler)
-        signal.signal(signal.SIGUSR2, worker_state_handler)
-
         broker.setup(worker_id, config['worker_queues'])
-
-        num_errors = 0
-        sleep_timeout = random.random() * 3
-
-        while 1:
-            if sleep_timeout:
-                time.sleep(sleep_timeout)
-                sleep_timeout = 0.
-            # noinspection PyBroadException
-            try:
-                try:
-                    messages = broker.get_messages(prefetch=1, timeout=fetch_timeout)
-                    num_errors = 0
-                except broker.DecodeError as exc:
-                    logger.warning("Can't decode incoming message: %s", str(exc))
-                    continue
-                except broker.BrokerError as exc:
-                    logger.critical('Broker error: %s', str(exc))
-                    sleep_timeout = (min(num_errors, 5) * 5) + 2 * random.random() + 1
-                    num_errors += 1
-                    continue
-
-                if not messages:
-                    continue
-
-                for ackkey, message in messages:
-                    if message.is_reply:
-                        start_time = None
-                        logger.info('Received reply %s.', message)
-                        broker.ack_message(ackkey)
-                    else:
-                        start_time = time.time()
-                        logger.info('Received task %s.', message)
-
-                    emit('task_start', {
-                        'id': message['id'],
-                        'task': message['task'],
-                        'time_limit': message.get('time_limit'),
-                        'start_time': start_time
-                    })
-
-                    logger.debug('Message: %r.', message)
-                    try:
-                        app.run_message(message, on_complete, (start_time, ackkey), fence=fence)
-                    except app.RejectMessage as exc:
-                        logger.error('Message rejected: %s: %s', str(exc), message)
-
-            except Exception:
-                # Something went wrong
-                tb = traceback.format_exc()
-                logger.critical('Critical error:\n%s', tb)
-
+        sleep(random() * 1.5)
+        main_loop()
     except WorkerInterrupt:
         pass
 

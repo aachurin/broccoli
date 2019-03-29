@@ -1,10 +1,8 @@
 import typing
 import inspect
-from broccoli import exceptions
 
 
 class Component:
-
     singleton = False
 
     def __init_subclass__(cls, **kwargs):
@@ -14,7 +12,7 @@ class Component:
                     'Component "%s" should not override `can_handle_parameter`, '
                     'since it is a singleton'
                 )
-                raise exceptions.ConfigurationError(msg % cls.__name__)
+                raise TypeError(msg % cls.__name__)
 
     def identity(self, parameter: inspect.Parameter):
         """
@@ -47,10 +45,10 @@ class Component:
         return_annotation = inspect.signature(self.resolve).return_annotation
         if return_annotation is inspect.Signature.empty:
             msg = (
-                'Component "%s" must include a return annotation on the '
-                '`resolve()` method, or override `can_handle_parameter`.'
-            ) % self.__class__.__name__
-            raise exceptions.ConfigurationError(msg)
+                      'Component "%s" must include a return annotation on the '
+                      '`resolve()` method, or override `can_handle_parameter`.'
+                  ) % self.__class__.__name__
+            raise TypeError(msg)
         return parameter.annotation is return_annotation
 
     @typing.no_type_check
@@ -59,7 +57,7 @@ class Component:
 
 
 ReturnValue = typing.TypeVar('ReturnValue')
-
-
-class Optional:
-    """Marker for optional components"""
+#
+#
+# class Optional:
+#     """Marker for optional components"""

@@ -2,12 +2,10 @@ import inspect
 import typing
 import functools
 from uuid import uuid4
-from broccoli import exceptions
-from broccoli.types import App
+from broccoli.types import App, Argument, Task as _Task
 
 
-class Signature(dict):
-
+class Subtask(dict):
     __slots__ = ('app',)
 
     def __init__(self, task, *, args=None, kwargs=None, app=None, **options):
@@ -22,15 +20,19 @@ class Signature(dict):
                 **options
             )
 
-    def apply(self, args=None, kwargs=None, **options):
+    def m(self, args=None, kwargs=None, **options):
         args = (self['args'] + args) if args else self['args']
         kwargs = {**self['kwargs'], **kwargs} if kwargs else self['kwargs']
         msg = {**self, **options, 'args': args, 'kwargs': kwargs}
         assert 'reply_to' not in msg, "can't use reply_to"
-        if 'id' not in msg:
-            msg['id'] = str(uuid4())
+        return msg
+
+    def apply(self, args=None, kwargs=None, **options):
+        msg = self.m(args=args, kwargs=kwargs, **options)
         if 'result_key' not in msg:
             msg['result_key'] = str(uuid4())
+        if 'id' not in msg:
+            msg['id'] = str(uuid4())
         self.app.send_message(msg)
         return self.app.result(msg['result_key'])
 
@@ -38,7 +40,7 @@ class Signature(dict):
         return self.apply(args=args, kwargs=kwargs)
 
     def __reduce__(self):
-        return Signature, (dict(self),)
+        return Subtask, (dict(self),)
 
     def __repr__(self):
         d = dict(self)
@@ -49,38 +51,23 @@ class Signature(dict):
         return '%s.s(%s)' % (task, ', '.join(parts))
 
 
-class Task:
-
+class Task(_Task):
     app: App = None
     name: str
     handler: typing.Callable
+    _subtask = Subtask
 
-    _signature = Signature
-
-    # Tuple of expected exceptions.
-    throws = ()
-    ignore_result = False
-
-    def apply(self, args=None, kwargs=None, id=None, result_key=None, **options):
-        id = id or str(uuid4())
-        result_key = result_key or str(uuid4())
-        msg = {'id': id, 'task': self.name, 'result_key': result_key, **options}
-        assert 'reply_to' not in msg, "can't use reply_to"
-        if args is not None:
-            msg['args'] = args
-        if kwargs is not None:
-            msg['kwargs'] = kwargs
-        self.app.send_message(msg)
-        return self.app.result(result_key)
+    def apply(self, args=None, kwargs=None, **options):
+        return self.subtask(args, kwargs, **options).apply()
 
     def delay(self, *args, **kwargs):
-        return self.apply(args=args, kwargs=kwargs)
+        return self.s(*args, *kwargs).delay()
 
     def s(self, *args, **kwargs):
-        return self._signature(self.name, args=args, kwargs=kwargs, app=self.app)
+        return self._subtask(self.name, args=args, kwargs=kwargs, app=self.app)
 
-    def signature(self, args=None, kwargs=None, **options):
-        return self._signature(self.name, args=args, kwargs=kwargs, **options, app=self.app)
+    def subtask(self, args=None, kwargs=None, **options):
+        return self._subtask(self.name, args=args, kwargs=kwargs, **options, app=self.app)
 
     def __call__(self, *args, **kwargs):
         return self.handler(*args, **kwargs)
@@ -89,15 +76,14 @@ class Task:
         return repr(self.handler)
 
     @staticmethod
-    def func_args_guard(*_, **__):
-        return (), {}
+    def get_arguments(*args, **kwargs):
+        raise NotImplementedError()
 
 
 task_options = ('throws', 'ignore_result')
 
 
-def create_task(app, func, name=None, **kwargs):
-
+def create_task(app, func, name=None, **options):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         __log_tb_start__ = None
@@ -107,12 +93,12 @@ def create_task(app, func, name=None, **kwargs):
         'app': app,
         'name': name or '%s.%s' % (func.__module__, func.__name__),
         'handler': staticmethod(wrapper),
-        'func_args_guard': staticmethod(create_func_args_guard(func, app)),
+        'get_arguments': staticmethod(create_get_arguments(func, app)),
         '__doc__': func.__doc__,
         '__module__': func.__module__
     }
 
-    for k, v in kwargs.items():
+    for k, v in options.items():
         if k not in task_options:
             msg = 'Invalid argument %s'
             raise TypeError(msg % k)
@@ -130,72 +116,53 @@ def create_task(app, func, name=None, **kwargs):
     return task
 
 
-def create_func_args_guard(func, app):
-    funcargs = []
+def create_get_arguments(func, app):
+    arg_names = []
     defaults = []
     kwdefaults = {}
-    annotations = {}
-
     no_more_args = False
-    var_args = False
-
     signature = inspect.signature(func)
-
-    if signature.return_annotation is not inspect.Parameter.empty:
-        annotations['return'] = signature.return_annotation
-
-    for parameter in signature.parameters.values():
-
-        if app.injector.get_component_class(parameter) is not None:
+    injector = app._injector
+    for param in signature.parameters.values():
+        if injector.get_resolved_to(param) is not Argument:
             no_more_args = True
             continue
-
-        parameter_name = parameter.name
-
         if no_more_args:
-            msg = 'Argument "%s" follows dependency on function "%s".'
-            raise exceptions.ConfigurationError(msg % (parameter_name, func.__qualname__))
-
-        if parameter.annotation is not inspect.Parameter.empty:
-            annotations[parameter_name] = parameter.annotation
-
-        if parameter.kind == inspect.Parameter.KEYWORD_ONLY and not var_args:
-            funcargs.append('*')
-            var_args = True
-
-        if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
-            if parameter.default is not inspect.Parameter.empty:
-                defaults.append(parameter.default)
-
-        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
-            if parameter.default is not inspect.Parameter.empty:
-                kwdefaults[parameter_name] = parameter.default
-
-        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            var_args = True
-            parameter_name = '*' + parameter_name
-
-        elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
-            parameter_name = '**' + parameter_name
+            msg = 'Argument %s follows dependency on function %s.'
+            raise TypeError(msg % (param.name, func.__qualname__))
+        if param.kind == param.POSITIONAL_OR_KEYWORD:
+            if param.default is not param.empty:
+                defaults += [param.default]
+        elif param.kind == param.KEYWORD_ONLY:
+            if '*' not in arg_names:
+                arg_names += ['*']
+            if param.default is not param.empty:
+                kwdefaults[param.name] = param.default
+        elif param.kind == param.VAR_POSITIONAL:
+            msg = 'Variadic arguments in form *%s are not allowed.'
+            raise TypeError(msg % param.name)
+        elif param.kind == param.VAR_KEYWORD:
+            msg = 'Keyword arguments in form **%s are not allowed.'
+            raise TypeError(msg % param.name)
         else:
             msg = 'Parameter kind %s is not supported'
-            raise TypeError(msg % parameter.kind)
+            raise TypeError(msg % param.kind)
+        arg_names += [param.name]
 
-        funcargs.append(parameter_name)
-
-    code = 'def %s(%s):\n  pass'
-    code = code % (func.__name__, ', '.join(funcargs))
+    args = (
+        func.__name__,
+        ', '.join(arg_names),
+        ', '.join(['%r:%s' % (x, x) for x in arg_names if x != '*'])
+    )
+    code = 'def %s(%s):\n  return {%s}' % args
     dct = {}
     exec(code, dct, dct)
-    adapter = dct[func.__name__]
 
+    get_arguments = dct[func.__name__]
     if defaults:
-        adapter.__defaults__ = tuple(defaults)
-
+        get_arguments.__defaults__ = tuple(defaults)
     if kwdefaults:
-        adapter.__kwdefaults__ = kwdefaults
+        get_arguments.__kwdefaults__ = kwdefaults
+    get_arguments.__module__ = func.__module__
 
-    adapter.__annotations__ = annotations
-    adapter.__module__ = func.__module__
-
-    return adapter
+    return get_arguments

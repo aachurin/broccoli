@@ -48,7 +48,6 @@ def initialize(app: App, config: Config):
 
 
 def main(app: App, logger: Logger, config: Config, schedule: Schedule = None):
-
     current_month = None
     current_day = None
     current_hour = None
@@ -131,7 +130,6 @@ class ConfigScheduleLoader(Schedule):
 
 @dataclass
 class ScheduleEntry:
-
     name: str
     task: str
     schedule: tuple

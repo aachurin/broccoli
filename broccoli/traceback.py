@@ -3,8 +3,7 @@ from traceback import StackSummary
 
 
 class Traceback(Exception):
-
-    __slots__ = ('tb', )
+    __slots__ = ('tb',)
 
     def __init__(self, tb):
         self.tb = tb

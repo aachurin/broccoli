@@ -1,27 +1,23 @@
 import time
 import typing
 import inspect
-from datetime import datetime
-from broccoli.injector import Injector
+from uuid import uuid4
+from broccoli.injector import ASyncInjector
 from broccoli.components import ReturnValue
 from broccoli.task import create_task
 from broccoli.result import AsyncResult
-from broccoli.types import App, Broker, Router, Logger, Config, Task, Message, Fence
+from broccoli.types import App, Broker, Task, Message, Arguments, Fence, TaskLogger
 from broccoli.traceback import extract_log_tb
-from broccoli.common import components as common_components
 from broccoli.utils import cached_property
-from broccoli.graph import build_graph
-
+from broccoli.graph import Graph
+from broccoli.exceptions import Reject
+from broccoli.router import ROUTER_COMPONENTS
+from broccoli.broker import BROKER_COMPONENTS
+from broccoli.logger import LOGGER_COMPONENTS
+from broccoli.config import CONFIG_COMPONENTS
+from broccoli.arguments import ARGUMENT_COMPONENTS
 
 __all__ = ('Broccoli',)
-
-
-class TaskNotFound(Exception):
-    pass
-
-
-class RejectMessage(Exception):
-    pass
 
 
 class nullfence:
@@ -34,12 +30,12 @@ class nullfence:
 
 
 class Broccoli(App):
+    _injector: ASyncInjector = None
+    _tasks: typing.Dict[str, Task] = None
+    result_factory = AsyncResult
+    graph_factory = Graph
 
-    injector: Injector = None
-    tasks: typing.Dict[str, Task] = None
-    result_class = AsyncResult
-
-    def __init__(self, components=None, settings=None, event_hooks=None) -> None:
+    def __init__(self, components=None, settings=None) -> None:
         if components:
             msg = 'components must be a list of instances of Component.'
             assert all([(not isinstance(component, type) and hasattr(component, 'resolve'))
@@ -48,97 +44,88 @@ class Broccoli(App):
             msg = 'settings must be a dict.'
             assert isinstance(settings, dict), msg
 
-        if event_hooks:
-            msg = 'event_hooks must be a list.'
-            assert isinstance(event_hooks, (list, tuple)), msg
-
-        self.init_injector(components or [])
         self.settings = settings
-        self.tasks = {}
-        self.context = {}
-        self.graphs = {}
-        self.event_hooks = event_hooks
+        self._init_injector(components or [])
+        self._tasks = {}
+        self._context = {}
+        self._graphs = {}
 
-    @cached_property
-    def TaskNotFound(self):
-        return TaskNotFound
+    def set_context(self, **context):
+        self._context = dict(self._context, **context)
+        self._graphs = {}
+        self._injector.clear_cache()
 
-    @cached_property
-    def RejectMessage(self):
-        return RejectMessage
+    def get_context(self):
+        return self._context
 
-    def update_context_and_reset(self, **context):
-        context = dict(self.context, **context)
-        self.context = context
-        self.graphs = {}
-        self.injector.clear_cache()
+    def set_hooks(self,
+                  on_request: typing.Callable = None,
+                  on_response: typing.Callable = None):
+        if on_request:
+            if inspect.iscoroutinefunction(on_request):
+                msg = 'Function %r may not be async.'
+                raise TypeError(msg % on_request)
+            self._on_request_hook = on_request
+        elif '_on_request_hook' in self.__dict__:
+            del self._on_request_hook
+        if on_response:
+            if inspect.iscoroutinefunction(on_response):
+                msg = 'Function %r may not be async.'
+                raise TypeError(msg % on_response)
+            self._on_response_hook = on_response
+        elif '_on_response_hook' in self.__dict__:
+            del self._on_response_hook
 
-    def init_injector(self, components):
-        components = [Injector.ensure_component(c) for c in components]
-
-        def has_component(cls):
-            for c in components:
-                if inspect.signature(c.resolve).return_annotation is cls:
-                    return True
-            return False
-
-        if not has_component(Broker):
-            from broccoli.broker import RedisBrokerComponent
-            components += [RedisBrokerComponent()]
-
-        if not has_component(Router):
-            from broccoli.router import SimpleRouterComponent
-            components += [SimpleRouterComponent()]
-
-        if not has_component(Logger):
-            from broccoli.logger import ConsoleLoggerComponent
-            components += [ConsoleLoggerComponent()]
-
-        if not has_component(Config):
-            from broccoli.config import ConfigComponent
-            components += [ConfigComponent()]
-
-        components += common_components
+    def _init_injector(self, components):
+        components = components or []
+        components += ROUTER_COMPONENTS
+        components += LOGGER_COMPONENTS
+        components += BROKER_COMPONENTS
+        components += CONFIG_COMPONENTS
+        components += ARGUMENT_COMPONENTS
 
         initial = {
             'app': App,
             'message': Message,
+            'args': Arguments,
             'task': Task,
             'exc': Exception,
             'fence': Fence
         }
 
-        self.injector = Injector(components, initial)
+        self._injector = ASyncInjector(components, initial)
 
-    def inject(self, funcs, args=None, kwargs=None, cache=True):
+    def inject(self, funcs, args=None, cache=True):
         state = {
             'app': self,
             'message': None,
+            'args': args,
             'task': None,
             'exc': None,
             'fence': None
         }
-        return self.injector.run(
+        return self._injector.run(
             funcs,
             state=state,
-            func_args=args,
-            func_kwargs=kwargs,
             cache=cache
         )
 
     def get_task(self, name: str):
         try:
-            return self.tasks[name]
+            return self._tasks[name]
         except KeyError:
-            raise self.TaskNotFound(name) from None
+            raise Reject('Task %s not found' % name)
 
     def task(self, *args, **kwargs):
         def create_task_wrapper(func):
+            if inspect.iscoroutinefunction(func):
+                msg = 'Function %r may not be async.'
+                raise TypeError(msg % func)
             task = create_task(self, func, **kwargs)
-            if task.name in self.tasks:
+            if task.name in self._tasks:
                 msg = 'Task with name %r is already registered.'
                 raise TypeError(msg % task.name)
-            self.tasks[task.name] = task
+            self._tasks[task.name] = task
             return task
 
         if len(args) == 1:
@@ -151,142 +138,137 @@ class Broccoli(App):
 
         return create_task_wrapper
 
-    def get_event_hooks(self):
-        event_hooks = []
-        for hook in self.event_hooks:
-            event_hooks.append(hook() if isinstance(hook, type) else hook)
+    def send_message(self, message: dict):
+        self._broker.send_message(message)
 
-        on_message = [
-            hook.on_message for hook in event_hooks
-            if hasattr(hook, 'on_message')
-        ]
+    def result(self, result_key: str):
+        return self.result_factory(self, result_key)
 
-        on_reply = [
-            hook.on_reply for hook in reversed(event_hooks)
-            if hasattr(hook, 'on_reply')
-        ]
+    def serve_message(self, message: dict, fence: Fence = None):
+        if 'id' not in message:
+            raise Reject('no id')
 
-        on_exception = [
-            hook.on_exception for hook in reversed(event_hooks)
-            if hasattr(hook, 'on_exception')
-        ]
+        if 'task' not in message:
+            raise Reject('no task')
 
-        return on_message, on_reply, on_exception
-
-    def got_reply(self, reply: Message):
-        if 'graph_id' not in reply:
-            raise self.RejectMessage('no graph_id')
-        graph_id = reply['graph_id']
-        if graph_id not in self.graphs:
-            raise self.RejectMessage('unexpected graph_id')
-        graph = self.graphs[graph_id]
-        if reply['id'] not in graph:
-            raise self.RejectMessage('unexpected reply id')
-        graph.set_complete(reply)
-
-    def run_message(self,
-                    message: Message,
-                    on_complete: typing.Callable = None,
-                    on_complete_args=None, *,
-                    fence=nullfence()):
-        if message.is_reply:
-            self.got_reply(message)
+        if 'reply_id' in message:
+            if 'graph_id' not in message:
+                raise Reject('no graph_id')
+            graph_id = message['graph_id']
+            if graph_id not in self._graphs:
+                raise Reject('unexpected graph_id')
+            graph = self._graphs[graph_id]
+            if message['reply_id'] not in graph:
+                raise Reject('unexpected reply id')
+            graph.run_reply(message)
+            return graph.get_pending_messages()
         else:
-            coro = self.run_message_async(message, on_complete, on_complete_args, fence)
+            coro = self._run_async(message, fence)
             try:
-                coro.send(None).on_complete = coro
-            except StopIteration:
-                pass
+                graph = coro.send(None)
+                graph.set_coroutine(coro)
+                return graph.get_pending_messages()
+            except StopIteration as stop:
+                return [stop.value]
 
-    async def run_message_async(self, message, on_complete, on_complete_args, fence):
-        if self.event_hooks is None:
-            on_message, on_reply, on_exception = [], [], []
-        else:
-            on_message, on_reply, on_exception = self.get_event_hooks()
-
+    async def _run_async(self, message, fence):
         state = {
             'app': self,
             'message': message,
+            'fence': fence,
+            'args': None,
             'task': None,
-            'exc': None,
-            'fence': fence
+            'exc': None
         }
 
         try:
             __log_tb_start__ = None
             task = self.get_task(message['task'])
             state['task'] = task
-            self.injector.run(on_message + [self.on_message], state=state)
-            task.func_args_guard(*(message.get('args') or ()), **(message.get('kwargs') or {}))
-            graph = build_graph(self, message)
-            if graph:
-                self.graphs[graph.id] = graph
-                try:
-                    await graph
-                finally:
-                    del self.graphs[graph.id]
             funcs = (
-                [task.handler, self.render_reply] +
-                on_reply +
-                [self.on_reply]
+                self._on_request,
+                self._on_request_hook,
+                self._build_graph,
+                task.handler,
+                self._on_response_hook,
+                self._on_response,
             )
-            result = self.injector.run(funcs,
-                                       func_args=message.get('args'),
-                                       func_kwargs=message.get('kwargs'),
-                                       state=state)
-
+            return await self._injector.run_async(funcs, state=state)
         except Exception as exc:
-            state['exc'] = exc
-            result = self.injector.run(
-                ([self.render_exception] + on_exception + [self.on_reply]),
-                state=state
-            )
-
-        on_complete(result, *(on_complete_args or ()))
-
-    def on_message(self, message: Message):
-        if 'expires_at' in message:
-            expires_at = message['expires_at']
-            if isinstance(expires_at, datetime):
-                if expires_at > datetime.utcnow():
-                    raise self.RejectMessage('Due to expiration time.')
-            elif isinstance(expires_at, int):
-                if expires_at > time.time():
-                    raise self.RejectMessage('Due to expiration time.')
+            try:
+                state['exc'] = exc
+                step = state.get('$step', 0)
+                if 0 < step < 4:
+                    funcs = (self._on_response_hook, self._on_response)
+                else:
+                    funcs = (self._on_response,)
+                return self._injector.run(funcs, state=state)
+            except Exception as inner_exc:
+                state['exc'] = inner_exc
+                return self._injector.run((self._on_response,), state)
 
     @staticmethod
-    def render_reply(message: Message, return_value: ReturnValue):
-        return message.reply(value=return_value)
-
-    def render_exception(self, message: Message, task: Task, exc: Exception):
-        if isinstance(exc, task.throws) or isinstance(exc, (self.TaskNotFound, self.RejectMessage)):
-            return message.reply(exc=exc)
-        traceback = extract_log_tb(exc)
-        if traceback:
-            return message.reply(exc=exc, traceback=traceback)
-        return message.reply(exc=exc)
+    def _on_request(message: Message):
+        expires_at = message.get('expires_at')
+        if expires_at is not None and isinstance(expires_at, (int, float)):
+            if expires_at > time.time():
+                raise Reject('Due to expiration time.')
 
     @staticmethod
-    def on_reply(message: Message, task: Task, reply: ReturnValue):
-        if message.get('ignore_result', task.ignore_result):
-            reply.pop('result_key', None)
+    def _on_request_hook(ret: ReturnValue):
+        return ret
+
+    async def _build_graph(self, task: Task, message: Message) -> Arguments:
+        graph = self.graph_factory(message)
+        if not graph.complete:
+            self._graphs[graph.id] = graph
+            try:
+                await graph
+            finally:
+                graph.close()
+                del self._graphs[graph.id]
+        return task.get_arguments(
+            *(message.get('args') or ()),
+            **(message.get('kwargs') or {})
+        )
+
+    @staticmethod
+    def _on_response_hook(ret: ReturnValue):
+        return ret
+
+    @staticmethod
+    def _on_response(message: Message,
+                     exc: Exception,
+                     logger: TaskLogger,
+                     return_value: ReturnValue,
+                     task: Task):
+        reply = {'id': str(uuid4()), 'task': message['task'], 'reply_id': message['id']}
+        if 'graph_id' in message:
+            reply['graph_id'] = message['graph_id']
+        if 'reply_to' in message:
+            reply['reply_to'] = message['reply_to']
+        if 'result_key' in message:
+            if message.get('ignore_result', task.ignore_result):
+                reply['result_key'] = None
+            else:
+                reply['result_key'] = message['result_key']
+        if '_context' in message:
+            reply['_context'] = message['_context']
+        if exc is not None:
+            reply['exc'] = exc
+            if isinstance(exc, task.throws) or isinstance(exc, Reject):
+                return reply
+            traceback = extract_log_tb(exc)
+            if traceback:
+                reply['traceback'] = traceback
+            logger.error('%s: %s\n%s', exc.__class__.__name__, exc, traceback)
+            return reply
+        reply['value'] = return_value
         return reply
-
-    def send_message(self, message: dict, reply_back: bool = False):
-        queue = message.get('queue') or self._router.get_queue(message['task'])
-        self._broker.send_message(queue, message, reply_back=reply_back)
-
-    def result(self, result_key: str):
-        return self.result_class(self, result_key)
 
     @cached_property
     def _broker(self) -> Broker:
         def get(obj: Broker):
             return obj
-        return self.inject([get], cache=False)
 
-    @cached_property
-    def _router(self) -> Router:
-        def get(obj: Router):
-            return obj
         return self.inject([get], cache=False)

@@ -1,5 +1,4 @@
 import inspect
-from broccoli import exceptions
 from broccoli.components import ReturnValue
 
 
@@ -9,33 +8,31 @@ class Injector:
     def __init__(self, components, initial):
         self.components = [self.ensure_component(comp) for comp in components]
         self.initial = dict(initial)
-        self.reverse_initial = {
-            val: key for key, val in initial.items()
-        }
+        self.reverse_initial = {val: key for key, val in initial.items()}
         self.singletons = {}
         self.resolver_cache = {}
 
-    def get_component_class(self, parameter):
+    def clear_cache(self):
+        self.resolver_cache.clear()
+
+    def get_resolved_to(self, parameter):
         if (parameter.annotation in (ReturnValue, inspect.Parameter) or
                 parameter.annotation in self.reverse_initial):
             return parameter.annotation
         for component in self.components:
             if component.can_handle_parameter(parameter):
-                return component.__class__
-
-    def clear_cache(self):
-        self.resolver_cache.clear()
+                return inspect.signature(component.resolve).return_annotation
 
     @staticmethod
     def ensure_component(comp):
         msg = 'Component "%s" must implement `identity` method.'
-        assert hasattr(comp, 'identity') and callable(comp.identity),\
+        assert hasattr(comp, 'identity') and callable(comp.identity), \
             msg % comp.__class__.__name__
         msg = 'Component "%s" must implement `can_handle_parameter` method.'
-        assert hasattr(comp, 'can_handle_parameter') and callable(comp.can_handle_parameter),\
+        assert hasattr(comp, 'can_handle_parameter') and callable(comp.can_handle_parameter), \
             msg % comp.__class__.__name__
         msg = 'Component "%s" must implement `resolve` method.'
-        assert hasattr(comp, 'resolve') and callable(comp.resolve),\
+        assert hasattr(comp, 'resolve') and callable(comp.resolve), \
             msg % comp.__class__.__name__
         return comp
 
@@ -97,12 +94,14 @@ class Injector:
                             if getattr(component, 'singleton', False):
                                 steps.append(self.resolve_singleton(component, identity))
                     break
-            # it's arg or kwarg
+            else:
+                msg = 'No component able to handle parameter %r on function %r.'
+                raise TypeError(msg % (parameter.name, func.__qualname__))
 
         is_async = inspect.iscoroutinefunction(func)
         if is_async and not self.allow_async:
-            msg = 'Function "%s" may not be async.'
-            raise exceptions.ConfigurationError(msg % (func.__qualname__, ))
+            msg = 'Function %r may not be async.'
+            raise TypeError(msg % (func.__qualname__,))
 
         step = (func, is_async, kwargs, consts, output_name, set_return)
         steps.append(step)
@@ -115,7 +114,7 @@ class Injector:
         def func(value):
             self.singletons[component] = value
 
-        return func, False, kwargs, (), '_$nocache', False
+        return func, False, kwargs, (), '$nocache', False
 
     def resolve_functions(self, funcs, state):
         steps = []
@@ -125,7 +124,7 @@ class Injector:
             steps.extend(func_steps)
         return steps
 
-    def run(self, funcs, state, func_args=None, func_kwargs=None, cache=True):
+    def run(self, funcs, state, cache=True):
         if not funcs:
             return
         funcs = tuple(funcs)
@@ -136,19 +135,19 @@ class Injector:
             if cache:
                 self.resolver_cache[funcs] = steps
 
-        pass_args_and_kwargs = bool(func_args or func_kwargs)
-        for func, is_async, kwargs, consts, output_name, set_return in steps:
-            kwargs = {key: state[val] for key, val in kwargs.items()}
-            kwargs.update(consts)
-            if set_return and pass_args_and_kwargs:
-                pass_args_and_kwargs = False
-                state[output_name] = func(*(func_args or ()), **(func_kwargs or {}), **kwargs)
-            else:
+        step = 0
+        try:
+            for func, is_async, kwargs, consts, output_name, set_return in steps:
+                kwargs = {key: state[val] for key, val in kwargs.items()}
+                kwargs.update(consts)
                 state[output_name] = func(**kwargs)
-            if set_return:
-                state['return_value'] = state[output_name]
+                if set_return:
+                    state['return_value'] = state[output_name]
+                    step += 1
+        finally:
+            state['$step'] = step
 
-        if cache and '_$nocache' in state:
+        if cache and '$nocache' in state:
             self.resolver_cache.pop(funcs)
 
         # noinspection PyUnboundLocalVariable
@@ -158,7 +157,7 @@ class Injector:
 class ASyncInjector(Injector):
     allow_async = True
 
-    async def run_async(self, funcs, state, func_args=None, func_kwargs=None, cache=True):
+    async def run_async(self, funcs, state, cache=True):
         if not funcs:
             return
         funcs = tuple(funcs)
@@ -169,23 +168,23 @@ class ASyncInjector(Injector):
             if cache:
                 self.resolver_cache[funcs] = steps
 
-        pass_args_and_kwargs = bool(func_args or func_kwargs)
-        for func, is_async, kwargs, consts, output_name, set_return in steps:
-            kwargs = {key: state[val] for key, val in kwargs.items()}
-            kwargs.update(consts)
-            if set_return and pass_args_and_kwargs:
-                pass_args_and_kwargs = False
-                output = func(*(func_args or ()), **(func_kwargs or {}), **kwargs)
-            else:
+        step = 0
+        try:
+            for func, is_async, kwargs, consts, output_name, set_return in steps:
+                kwargs = {key: state[val] for key, val in kwargs.items()}
+                kwargs.update(consts)
                 output = func(**kwargs)
-            if is_async:
-                state[output_name] = await output
-            else:
-                state[output_name] = output
-            if set_return:
-                state['return_value'] = state[output_name]
+                if is_async:
+                    state[output_name] = await output
+                else:
+                    state[output_name] = output
+                if set_return:
+                    state['return_value'] = state[output_name]
+                    step += 1
+        finally:
+            state['$step'] = step
 
-        if cache and '_$nocache' in state:
+        if cache and '$nocache' in state:
             self.resolver_cache.pop(funcs)
 
         # noinspection PyUnboundLocalVariable

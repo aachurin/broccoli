@@ -1,3 +1,10 @@
+class WorkerInterrupt(BaseException):
+    pass
 
-class ConfigurationError(Exception):
+
+class Shutdown(BaseException):
+    pass
+
+
+class Reject(Exception):
     pass

@@ -4,12 +4,10 @@ import importlib.util
 from broccoli.types import App, Config
 from broccoli.components import Component
 
-
-__all__ = ('ConfigComponent', )
+__all__ = ('ConfigComponent',)
 
 
 class ConfigComponent(Component):
-
     singleton = True
 
     def __init__(self,
@@ -33,3 +31,8 @@ class ConfigComponent(Component):
                     continue
                 ret[key] = getattr(conf, key)
         return ret
+
+
+CONFIG_COMPONENTS = [
+    ConfigComponent()
+]
