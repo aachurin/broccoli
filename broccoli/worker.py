@@ -315,18 +315,19 @@ def worker(conn, worker_id, app: App, broker: Broker, logger_service: LoggerServ
         while 1:
             try:
                 if 'result_key' in reply:
-                    broker.set_result(reply['result_key'], reply, expires_in=result_expires_in)
+                    if reply['result_key']:
+                        broker.set_result(reply['result_key'], reply, expires_in=result_expires_in)
+                        logger.debug('Set result: %r', MsgRepr(reply))
                     broker.ack(key)
-                    logger.debug('Set result: %r', MsgRepr(reply))
                     return
                 elif 'reply_to' in reply:
-                    logger.debug('Send reply: %r', MsgRepr(reply))
                     broker.send_reply(reply['reply_to'], reply)
+                    logger.debug('Send reply: %r', MsgRepr(reply))
                     broker.ack(key)
                     return
                 else:
-                    logger.debug('Send message: %r', MsgRepr(reply))
                     broker.send_message(reply, reply_back=True)
+                    logger.debug('Send message: %r', MsgRepr(reply))
                     return
             except broker.BrokerError as err:
                 logger.critical('Broker error: %s', str(err))

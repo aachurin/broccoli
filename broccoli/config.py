@@ -18,7 +18,6 @@ class ConfigComponent(Component):
         self.settings_module = settings_module
         self.defaults = defaults
 
-    # noinspection PyMethodOverriding
     def resolve(self, app: App) -> Config:
         module = os.environ.get(self.module_environ_var, self.settings_module)
         ret = dict(app.settings) if app.settings else {}

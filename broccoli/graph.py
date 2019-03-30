@@ -8,8 +8,22 @@ class Fut:
         return (yield)
 
 
+def co_send(coro, value=None):
+    try:
+        coro.send(value)
+    except StopIteration as stop:
+        return stop.value
+
+
+def co_throw(coro, exc):
+    try:
+        coro.throw(exc)
+    except StopIteration as stop:
+        return stop.value
+
+
 class Graph(dict):
-    __slots__ = ('id', '_coro', '_pending', 'complete')
+    __slots__ = ('id', '_coro', '_pending')
 
     S = Subtask
 
@@ -17,8 +31,7 @@ class Graph(dict):
         self.id = message['id']
         self._coro = None
         self._pending = []
-        self._build(message)
-        self.complete = not self._pending
+        self._add_subtasks(message)
 
     def __await__(self):
         __log_tb_start__ = None
@@ -37,73 +50,45 @@ class Graph(dict):
         return []
 
     def run_reply(self, reply):
-        waiters = self.pop(reply['reply_id'])
         if 'exc' in reply:
             exc = reply['exc']
             traceback = reply.get('traceback')
             if traceback:
                 exc.__cause__ = Traceback(traceback)
-            try:
-                self._coro.throw(exc)
-            except StopIteration as ret:
-                self._pending.append(ret.value)
+            self._pending.append(co_throw(self._coro, exc))
         else:
-            for coro, key, is_arg in waiters:
-                try:
-                    coro.send((key, reply.get('value'), is_arg))
-                except StopIteration:
-                    pass
-
+            for coro in self.pop(reply['reply_id']):
+                args = co_send(coro, reply.get('value'))
             if not self:
-                try:
-                    self._coro.send(None)
-                except StopIteration as ret:
-                    self._pending.append(ret.value)
+                self._pending.append(co_send(self._coro, args))
 
-    def _build(self, subtask, subtask_id=None, memo=None):
+    def _add_subtasks(self, subtask, subtask_id=None, memo=None):
         if memo is None:
             memo = {}
-
-        S = self.S
-        uuid4 = uuid.uuid4
-        args = subtask.get('args')
-        kwargs = subtask.get('kwargs')
-
-        wait_args = []
-        if args:
-            wait_args += [(key, s, True) for key, s in enumerate(args) if isinstance(s, S)]
-        if kwargs:
-            wait_args += [(key, s, False) for key, s in kwargs.items() if isinstance(s, S)]
-
-        if wait_args:
-            coro = self._await_subtasks(subtask, len(wait_args), subtask_id)
-            for key, subtask, is_arg in wait_args:
+        subtasks = subtask.get('subtasks')
+        if subtasks:
+            uuid4 = uuid.uuid4
+            coro = self._wait_subtasks(subtask, len(subtasks), subtask_id)
+            for subtask in subtasks:
                 memo_key = id(subtask)
                 if memo_key in memo:
-                    self[memo[memo_key]].append((coro, key, is_arg))
+                    self[memo[memo_key]].append(coro)
                 else:
-                    sid = str(uuid4())
-                    memo[memo_key] = sid
-                    self[sid] = [(coro, key, is_arg)]
-                    self._build(subtask, sid, memo)
-            coro.send(None)
+                    subtask_id = str(uuid4())
+                    memo[memo_key] = subtask_id
+                    self[subtask_id] = [coro]
+                    if not self._add_subtasks(subtask, subtask_id, memo):
+                        self._pending.append(subtask.m(id=subtask_id, graph_id=self.id))
+            co_send(coro)
+            return True
+        return False
 
-        elif subtask_id is not None:
-            self._pending.append(subtask.m(id=subtask_id, graph_id=self.id))
-
-    async def _await_subtasks(self, subtask, nargs, subtask_id=None, fut=Fut()):
-        args = subtask.get('args')
-        kwargs = subtask.get('kwargs')
-        if args:
-            args = subtask['args'] = list(args)
-
+    async def _wait_subtasks(self, subtask, nargs, subtask_id=None, fut=Fut()):
+        args = []
         while nargs > 0:
-            key, value, is_arg = await fut
-            if is_arg:
-                args[key] = value
-            else:
-                kwargs[key] = value
+            args.append(await fut)
             nargs -= 1
-
         if subtask_id is not None:
-            self._pending.append(subtask.m(id=subtask_id, graph_id=self.id))
+            self._pending.append(subtask.m(args=args, id=subtask_id, graph_id=self.id))
+        else:
+            return args

@@ -39,6 +39,22 @@ class Subtask(dict):
     def delay(self, *args, **kwargs):
         return self.apply(args=args, kwargs=kwargs)
 
+    def clone(self):
+        res = self.__class__(self)
+        res.app = self.app
+        return res
+
+    def __or__(self, other):
+        if not isinstance(other, Subtask):
+            msg = 'Subtask expected, got %r'
+            raise TypeError(msg % type(other))
+        new = other.clone()
+        if 'subtasks' not in new:
+            new['subtasks'] = (self,)
+        else:
+            new['subtasks'] += (self,)
+        return new
+
     def __reduce__(self):
         return Subtask, (dict(self),)
 
@@ -69,8 +85,7 @@ class Task(_Task):
     def subtask(self, args=None, kwargs=None, **options):
         return self._subtask(self.name, args=args, kwargs=kwargs, **options, app=self.app)
 
-    def __call__(self, *args, **kwargs):
-        return self.handler(*args, **kwargs)
+    __call__ = s
 
     def __repr__(self):
         return repr(self.handler)

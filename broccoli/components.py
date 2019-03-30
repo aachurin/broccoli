@@ -57,7 +57,3 @@ class Component:
 
 
 ReturnValue = typing.TypeVar('ReturnValue')
-#
-#
-# class Optional:
-#     """Marker for optional components"""

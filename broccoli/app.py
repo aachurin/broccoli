@@ -178,7 +178,8 @@ class Broccoli(App):
             'fence': fence,
             'args': None,
             'task': None,
-            'exc': None
+            'exc': None,
+            'return_value': None
         }
 
         try:
@@ -211,7 +212,7 @@ class Broccoli(App):
     def _on_request(message: Message):
         expires_at = message.get('expires_at')
         if expires_at is not None and isinstance(expires_at, (int, float)):
-            if expires_at > time.time():
+            if expires_at < time.time():
                 raise Reject('Due to expiration time.')
 
     @staticmethod
@@ -219,16 +220,17 @@ class Broccoli(App):
         return ret
 
     async def _build_graph(self, task: Task, message: Message) -> Arguments:
-        graph = self.graph_factory(message)
-        if not graph.complete:
+        args = ()
+        if message.get('subtasks'):
+            graph = self.graph_factory(message)
             self._graphs[graph.id] = graph
             try:
-                await graph
+                args = await graph
             finally:
                 graph.close()
                 del self._graphs[graph.id]
         return task.get_arguments(
-            *(message.get('args') or ()),
+            *((message.get('args') or ()) + tuple(args)),
             **(message.get('kwargs') or {})
         )
 
@@ -257,12 +259,16 @@ class Broccoli(App):
         if exc is not None:
             reply['exc'] = exc
             if isinstance(exc, task.throws) or isinstance(exc, Reject):
+                logger.error("Task {'id': %r, 'task': %r} raised exception %s: %s",
+                             message['id'], message['task'], exc.__class__.__name__, exc)
                 return reply
-            traceback = extract_log_tb(exc)
-            if traceback:
-                reply['traceback'] = traceback
-            logger.error('%s: %s\n%s', exc.__class__.__name__, exc, traceback)
-            return reply
+            else:
+                traceback = extract_log_tb(exc)
+                if traceback:
+                    reply['traceback'] = traceback
+                logger.error("Task {'id': %r, 'task': %r} raised exception %s: %s\n%s",
+                             message['id'], message['task'], exc.__class__.__name__, exc, traceback)
+                return reply
         reply['value'] = return_value
         return reply
 
